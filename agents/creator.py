@@ -1,0 +1,165 @@
+import json
+import os
+import requests
+
+
+def _extract_json_object(text: str) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return ""
+
+
+def _gemini_list_models(*, api_key: str) -> list[str]:
+    resp = requests.get(
+        "https://generativelanguage.googleapis.com/v1beta/models",
+        params={"key": api_key},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    models = []
+    for m in data.get("models", []) or []:
+        name = m.get("name")
+        methods = m.get("supportedGenerationMethods") or []
+        if name and ("generateContent" in methods):
+            if name.startswith("models/"):
+                name = name[len("models/") :]
+            models.append(name)
+    return models
+
+
+def _gemini_generate_email_json(*, api_key: str, model: str, prompt: str) -> dict:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    resp = requests.post(
+        url,
+        params={"key": api_key},
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {"responseMimeType": "application/json"},
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    data = resp.json()
+    text = (
+        data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "")
+    )
+
+    json_text = _extract_json_object(text)
+    parsed = json.loads(json_text or text)
+    if not all(k in parsed for k in ("subject", "body", "url")):
+        raise ValueError("Gemini response JSON missing required keys")
+    return parsed
+
+
+def create_content(plan: dict):
+    """
+    Generates marketing copy and email content based on the campaign plan.
+
+    Args:
+        plan (dict): The output from the planner agent.
+
+    Returns:
+        dict: A dictionary containing the email subject, body, and a call-to-action URL.
+    """
+    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = api_key.strip() if api_key else api_key
+
+    if api_key:
+        try:
+            prompt = (
+                "You are a marketing email writer. Return ONLY valid JSON with keys: "
+                '"subject", "body", "url". Keep body concise.\n\n'
+                f"Campaign strategy: {plan.get('strategy', '')}\n"
+                f"Target audience: {plan.get('target_audience', [])}\n"
+            )
+
+            preferred_model = os.getenv("GEMINI_MODEL")
+            preferred_model = preferred_model.strip() if preferred_model else None
+
+            model_candidates = [
+                preferred_model,
+                "gemini-1.5-flash",
+                "gemini-1.5-flash-latest",
+                "gemini-1.5-pro",
+                "gemini-1.5-pro-latest",
+            ]
+            model_candidates = [m for m in model_candidates if m]
+
+            last_error: Exception | None = None
+            for model in model_candidates:
+                try:
+                    parsed = _gemini_generate_email_json(
+                        api_key=api_key,
+                        model=model,
+                        prompt=prompt,
+                    )
+                    return {
+                        "subject": str(parsed["subject"]).strip(),
+                        "body": str(parsed["body"]).strip(),
+                        "url": str(parsed["url"]).strip(),
+                        "_source": "gemini",
+                        "_model": model,
+                    }
+                except Exception as e:
+                    last_error = e
+                    continue
+
+            discovered = []
+            try:
+                discovered = _gemini_list_models(api_key=api_key)
+            except Exception as e:
+                last_error = e
+
+            for model in discovered:
+                try:
+                    parsed = _gemini_generate_email_json(
+                        api_key=api_key,
+                        model=model,
+                        prompt=prompt,
+                    )
+                    return {
+                        "subject": str(parsed["subject"]).strip(),
+                        "body": str(parsed["body"]).strip(),
+                        "url": str(parsed["url"]).strip(),
+                        "_source": "gemini",
+                        "_model": model,
+                    }
+                except Exception as e:
+                    last_error = e
+                    continue
+
+            raise last_error or RuntimeError("Gemini generation failed")
+        except Exception as e:
+            return {
+                "subject": "Boost Your Marketing with AI!",
+                "body": "Hello,\n\nWe noticed you are looking to automate your marketing. Our AI agents can help!",
+                "url": "https://example.com/signup",
+                "_source": "mock",
+                "_error": str(e),
+            }
+
+    return {
+        "subject": "Boost Your Marketing with AI!",
+        "body": "Hello,\n\nWe noticed you are looking to automate your marketing. Our AI agents can help!",
+        "url": "https://example.com/signup",
+        "_source": "mock",
+    }
