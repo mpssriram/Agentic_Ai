@@ -1,0 +1,102 @@
+openapi: 3.0.0
+info:
+  title: InXiteOut CampaignX API
+  version: 1.0.0
+servers:
+  - url: https://campaignx.inxiteout.ai
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+security:
+  - ApiKeyAuth: []
+paths:
+  /api/v1/get_customer_cohort:
+    get:
+      summary: Get Customer Cohort
+      description: Retrieves the list of customers that campaigns can be sent to.
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        customer_id:
+                          type: string
+                        email:
+                          type: string
+                        name:
+                          type: string
+  /api/v1/send_campaign:
+    post:
+      summary: Send Campaign
+      description: Submit a new marketing campaign to a targeted customer cohort.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, body, list_customer_ids, send_time]
+              properties:
+                subject:
+                  type: string
+                body:
+                  type: string
+                list_customer_ids:
+                  type: array
+                  items:
+                    type: string
+                send_time:
+                  type: string
+                  description: "Format strictly as: DD:MM:YY HH:MM:SS"
+      responses:
+        '200':
+          description: Campaign submitted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaign_id:
+                    type: string
+  /api/v1/get_report:
+    get:
+      summary: Get Report
+      description: Retrieves the performance report for a specific campaign.
+      parameters:
+        - in: query
+          name: campaign_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Report retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        customer_id:
+                          type: string
+                        EO:
+                          type: string
+                          description: "Email Opened: Y/N"
+                        EC:
+                          type: string
+                          description: "Email Clicked: Y/N"

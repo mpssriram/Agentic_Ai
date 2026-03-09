@@ -80,8 +80,10 @@ def create_content(plan: dict):
     Returns:
         dict: A dictionary containing the email subject, body, and a call-to-action URL.
     """
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.environ.get("GOOGLE_API_KEY")
     api_key = api_key.strip() if api_key else api_key
+    if api_key == "your_gemini_api_key_here":
+        api_key = None
 
     if api_key:
         try:
@@ -92,11 +94,8 @@ def create_content(plan: dict):
                 f"Target audience: {plan.get('target_audience', [])}\n"
             )
 
-            preferred_model = os.getenv("GEMINI_MODEL")
-            preferred_model = preferred_model.strip() if preferred_model else None
-
             model_candidates = [
-                preferred_model,
+                "gemini-2.5-flash",
                 "gemini-1.5-flash",
                 "gemini-1.5-flash-latest",
                 "gemini-1.5-pro",
@@ -157,9 +156,21 @@ def create_content(plan: dict):
                 "_error": str(e),
             }
 
-    return {
-        "subject": "Boost Your Marketing with AI!",
-        "body": "Hello,\n\nWe noticed you are looking to automate your marketing. Our AI agents can help!",
-        "url": "https://example.com/signup",
-        "_source": "mock",
-    }
+    strategy = str(plan.get("strategy", "")).strip()
+    audience = plan.get("target_audience", []) or []
+    audience_text = ", ".join([str(a).strip() for a in audience if str(a).strip()])
+    url = "https://superbfsi.com/xdeposit/explore/"
+    subject = "🚀 XDeposit is Here — Earn More with SuperBFSI"
+    body = (
+        "Hello,\n\n"
+        f"{strategy if strategy else 'We are excited to introduce XDeposit, our flagship Term Deposit product.'}\n\n"
+        f"Designed for: {audience_text if audience_text else 'customers across India'}.\n\n"
+        "**Why choose XDeposit?**\n"
+        "- Higher returns than typical term deposits\n"
+        "- Simple, secure, and easy to explore\n\n"
+        "**Take action now:**\n"
+        f"{url}\n\n"
+        "Regards,\n"
+        "SuperBFSI"
+    )
+    return {"subject": subject, "body": body, "url": url, "_source": "template"}
