@@ -85,17 +85,25 @@ def create_content(plan: dict):
     if api_key == "your_gemini_api_key_here":
         api_key = None
 
+    mandatory_url = "https://superbfsi.com/xdeposit/explore/"
+
     if api_key:
         try:
             prompt = (
-                "You are a marketing email writer. Return ONLY valid JSON with keys: "
-                '"subject", "body", "url". Keep body concise.\n\n'
-                f"Campaign strategy: {plan.get('strategy', '')}\n"
-                f"Target audience: {plan.get('target_audience', [])}\n"
+                "You are an expert marketing email writer. Return ONLY valid JSON with keys: "
+                '"subject", "body", "url". \n\n'
+                "Requirements:\n"
+                f"- Campaign strategy: {plan.get('strategy', '')}\n"
+                f"- Target audience: {plan.get('target_audience', [])}\n"
+                f"- Goals: {plan.get('goals', [])}\n"
+                f"- Mandatory URL: {mandatory_url}\n"
+                "- Include engaging emojis in both the subject and the body.\n"
+                "- Use Markdown font variations (e.g., **bold**, _italics_) for emphasis in the body content.\n"
+                "- Ensure the tone is professional yet persuasive.\n"
             )
 
             model_candidates = [
-                "gemini-2.5-flash",
+                "gemini-2.0-flash",
                 "gemini-1.5-flash",
                 "gemini-1.5-flash-latest",
                 "gemini-1.5-pro",
@@ -114,31 +122,7 @@ def create_content(plan: dict):
                     return {
                         "subject": str(parsed["subject"]).strip(),
                         "body": str(parsed["body"]).strip(),
-                        "url": str(parsed["url"]).strip(),
-                        "_source": "gemini",
-                        "_model": model,
-                    }
-                except Exception as e:
-                    last_error = e
-                    continue
-
-            discovered = []
-            try:
-                discovered = _gemini_list_models(api_key=api_key)
-            except Exception as e:
-                last_error = e
-
-            for model in discovered:
-                try:
-                    parsed = _gemini_generate_email_json(
-                        api_key=api_key,
-                        model=model,
-                        prompt=prompt,
-                    )
-                    return {
-                        "subject": str(parsed["subject"]).strip(),
-                        "body": str(parsed["body"]).strip(),
-                        "url": str(parsed["url"]).strip(),
+                        "url": mandatory_url,
                         "_source": "gemini",
                         "_model": model,
                     }
@@ -149,9 +133,9 @@ def create_content(plan: dict):
             raise last_error or RuntimeError("Gemini generation failed")
         except Exception as e:
             return {
-                "subject": "Boost Your Marketing with AI!",
-                "body": "Hello,\n\nWe noticed you are looking to automate your marketing. Our AI agents can help!",
-                "url": "https://example.com/signup",
+                "subject": "🚀 Boost Your Marketing with AI!",
+                "body": "Hello,\n\nWe noticed you are looking to **automate** your marketing. Our AI agents can help! 🤖",
+                "url": mandatory_url,
                 "_source": "mock",
                 "_error": str(e),
             }
@@ -159,18 +143,17 @@ def create_content(plan: dict):
     strategy = str(plan.get("strategy", "")).strip()
     audience = plan.get("target_audience", []) or []
     audience_text = ", ".join([str(a).strip() for a in audience if str(a).strip()])
-    url = "https://superbfsi.com/xdeposit/explore/"
     subject = "🚀 XDeposit is Here — Earn More with SuperBFSI"
     body = (
         "Hello,\n\n"
-        f"{strategy if strategy else 'We are excited to introduce XDeposit, our flagship Term Deposit product.'}\n\n"
-        f"Designed for: {audience_text if audience_text else 'customers across India'}.\n\n"
+        f"{strategy if strategy else 'We are excited to introduce **XDeposit**, our flagship Term Deposit product.'} ✨\n\n"
+        f"Designed for: _{audience_text if audience_text else 'customers across India'}_.\n\n"
         "**Why choose XDeposit?**\n"
-        "- Higher returns than typical term deposits\n"
-        "- Simple, secure, and easy to explore\n\n"
+        "- 📈 **Higher returns** than typical term deposits\n"
+        "- 🛡️ Simple, secure, and easy to explore\n\n"
         "**Take action now:**\n"
-        f"{url}\n\n"
+        f"{mandatory_url} 👈\n\n"
         "Regards,\n"
         "SuperBFSI"
     )
-    return {"subject": subject, "body": body, "url": url, "_source": "template"}
+    return {"subject": subject, "body": body, "url": mandatory_url, "_source": "template"}
