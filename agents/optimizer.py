@@ -110,11 +110,11 @@ class OptimizationResult(BaseModel):
 def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
     spec_path = "superbfsi_api_spec.yaml"
     if not os.path.exists(spec_path):
-        return {"open_rate": 0.0, "click_rate": 0.0}, "spec not found"
+        raise FileNotFoundError("superbfsi_api_spec.yaml not found.")
 
     api_key = os.getenv("CAMPAIGNX_API_KEY")
     if not api_key:
-        return {"open_rate": 0.0, "click_rate": 0.0}, "api key missing"
+        raise ValueError("CAMPAIGNX_API_KEY not set.")
 
     with open(spec_path, "r") as f:
         raw_spec = yaml.safe_load(f)
@@ -124,31 +124,8 @@ def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
     json_spec = JsonSpec(dict_=raw_spec, max_value_length=4000)
 
     llm_key = os.environ.get("GOOGLE_API_KEY")
-    if llm_key == "your_gemini_api_key_here":
-        llm_key = None
-    base_url = _spec_base_url(raw_spec)
-
-    def _fetch_via_http() -> tuple[dict, str]:
-        report_url = f"{base_url}/api/v1/get_report"
-        r = requests.get(report_url, headers=headers, params={"campaign_id": campaign_id}, timeout=30)
-        logs = f"GET {report_url} -> {r.status_code}"
-        try:
-            r.raise_for_status()
-            payload = r.json()
-        except Exception:
-            return {"open_rate": 0.0, "click_rate": 0.0}, logs
-
-        records = payload.get("data", []) or []
-        total = len(records)
-        if total <= 0:
-            return {"open_rate": 0.0, "click_rate": 0.0}, logs
-
-        open_count = sum(1 for rec in records if rec.get("EO") == "Y")
-        click_count = sum(1 for rec in records if rec.get("EC") == "Y")
-        return {"open_rate": round(open_count*100/total, 2), "click_rate": round(click_count*100/total, 2)}, logs
-
-    if not llm_key:
-        return _fetch_via_http()
+    if not llm_key or llm_key == "your_gemini_api_key_here":
+        raise ValueError("GOOGLE_API_KEY missing for Analytics Agent.")
 
     llm = _make_llm(google_api_key=llm_key, temperature=0)
     toolkit = OpenAPIToolkit.from_llm(llm=llm, json_spec=json_spec, requests_wrapper=requests_wrapper, allow_dangerous_requests=True)
@@ -164,13 +141,14 @@ def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
         payload = json.loads(_extract_json_object(output) or output)
         records = payload.get("data", []) or []
         total = len(records)
-        if total > 0:
-            open_count = sum(1 for r in records if r.get("EO") == "Y")
-            click_count = sum(1 for r in records if r.get("EC") == "Y")
-            return {"open_rate": round(open_count*100/total, 2), "click_rate": round(click_count*100/total, 2)}, cb.text()
-    except Exception:
-        pass
-    return _fetch_via_http()
+        if total <= 0:
+            return {"open_rate": 0.0, "click_rate": 0.0}, cb.text()
+
+        open_count = sum(1 for rec in records if rec.get("EO") == "Y")
+        click_count = sum(1 for rec in records if rec.get("EC") == "Y")
+        return {"open_rate": round(open_count*100/total, 2), "click_rate": round(click_count*100/total, 2)}, cb.text()
+    except Exception as e:
+        raise RuntimeError(f"Analytics Agent failed: {e}")
 
 
 def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
@@ -180,25 +158,8 @@ def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
     performance_score = (click_rate * 0.7) + (open_rate * 0.3)
 
     llm_key = os.environ.get("GOOGLE_API_KEY")
-    if llm_key == "your_gemini_api_key_here":
-        llm_key = None
-
-    if not llm_key:
-        # Static fallback
-        return {
-            "performance_score": performance_score,
-            "metrics": metrics,
-            "optimized_content": {
-                "overall_sentiment": "Performance is moderate. Click rate needs improvement.",
-                "micro_segments": [{
-                    "segment_name": "General Optimization",
-                    "reasoning": "Need more urgency in the message.",
-                    "subject": "🔥 Last Chance: XDeposit Higher Returns!",
-                    "body": "Don't miss out on **XDeposit**! 🚀"
-                }]
-            },
-            "logs": report_logs,
-        }
+    if not llm_key or llm_key == "your_gemini_api_key_here":
+         raise ValueError("GOOGLE_API_KEY missing for Optimizer Agent.")
 
     llm = _make_llm(google_api_key=llm_key, temperature=0.7)
     parser = JsonOutputParser(pydantic_object=OptimizationResult)
@@ -217,7 +178,7 @@ def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
 
         Task:
         1. Analyze the performance and provide a sentiment analysis.
-        2. Identify 2-3 micro-segments (e.g., 'Highly Engaged but No Click', 'Passive Readers', 'Senior Citizens' if applicable).
+        2. Identify 2-3 micro-segments based on your expertise.
         3. For each micro-segment, generate an optimized version of the email (subject and body) with emojis and Markdown font variations.
         
         {format_instructions}
@@ -243,10 +204,4 @@ def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
             "logs": report_logs,
         }
     except Exception as e:
-        print(f"Error optimizing: {e}")
-        return {
-            "performance_score": performance_score,
-            "metrics": metrics,
-            "optimized_content": {"overall_sentiment": "Error during optimization", "micro_segments": []},
-            "logs": report_logs,
-        }
+        raise RuntimeError(f"Optimization Agent failed: {e}")
