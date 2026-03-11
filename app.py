@@ -6,6 +6,10 @@ from agents.creator import create_content
 from agents.executor import execute_campaign, fetch_customer_cohort_fresh, filter_customer_cohort
 from agents.optimizer import optimize_campaign
 
+# enable verbose LangChain debugging (helps expose HTTP 422 payloads)
+import langchain
+langchain.debug = True
+
 load_dotenv()
 
 st.set_page_config(page_title="CampaignX - AI Marketing Automation", layout="wide")
@@ -82,6 +86,7 @@ if "plan" in st.session_state:
     try:
         with st.spinner("Fetching live customer cohort (no cache) and computing final target list..."):
             cohort = fetch_customer_cohort_fresh()
+            print(f"[DEBUG] fetched cohort of {len(cohort)} records")
             filt = filter_customer_cohort(
                 cohort,
                 st.session_state["plan"].get("target_audience"),
@@ -89,6 +94,7 @@ if "plan" in st.session_state:
             )
             approved_ids = filt.get("customer_ids") or []
             approved_customers = filt.get("customers") or []
+            print(f"[DEBUG] filtered down to {len(approved_ids)} approved ids")
             st.session_state["approved_customer_ids"] = approved_ids
             st.session_state["approved_customers"] = approved_customers
 
@@ -105,9 +111,12 @@ if "plan" in st.session_state:
                         "inactive": c.get("inactive"),
                     }
                 )
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-        else:
+            st.dataframe(rows, width='stretch', hide_index=True)
+        elif approved_ids:
+            # no detailed customer objects, just IDs
             st.write(approved_ids)
+        else:
+            st.info("No customers were approved -- check the cohort or targeting rules.")
 
     except Exception as e:
         st.error(f"Failed to fetch live cohort / compute final customer list: {e}")
@@ -122,7 +131,8 @@ if "plan" in st.session_state:
 
             approved_ids = st.session_state.get("approved_customer_ids") or []
             total = len(approved_ids)
-            batch_size = 250
+            # process full cohort in chunks of 200 customers
+            batch_size = 200
             num_batches = (total + batch_size - 1) // batch_size if total else 0
 
             campaign_ids: list[str] = []

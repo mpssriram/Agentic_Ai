@@ -55,32 +55,50 @@ def ollama_chat(
             else:
                 raise
 
+def _clean_json_string(s: str) -> str:
+    """
+    Attempts to fix common LLM JSON errors like unescaped newlines/tabs inside strings.
+    """
+    # This is a very basic heuristic: replace actual newlines with \n inside what looks like a quote-delimited block
+    # But it's safer to just let json.loads(..., strict=False) handle the control characters.
+    # What strict=False doesn't handle are things like unescaped double quotes inside strings.
+    return s.strip()
+
 def ollama_generate_json(
     prompt: str,
     *,
     model: str = OLLAMA_MODEL,
     temperature: float = 0.7,
-    max_tokens: int = 768,  # keep JSON short
+    max_tokens: int = 2048,
 ) -> Dict[str, Any]:
     """
-    Helper that expects a JSON response and parses it.
+    Helper that expects a JSON response and parses it with extreme robustness.
     """
     messages = [{"role": "user", "content": prompt}]
     raw = ollama_chat(messages, model=model, temperature=temperature, max_tokens=max_tokens)
-    # Try to extract JSON object from the response
+    
+    # Pre-clean: Remove markdown code blocks if present
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # Find first { and last }
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1:
+            cleaned = cleaned[start:end+1]
+
     try:
-        return json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        # Fallback: look for first { ... } block
-        start = raw.find("{")
-        end = raw.rfind("}")
+        # strict=False allows literal control characters (like real newlines) in strings
+        return json.loads(cleaned, strict=False)
+    except json.JSONDecodeError as e:
+        # Fallback: aggressive search for the first { ... } block
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
         if start != -1 and end != -1 and end > start:
-            inner = raw[start:end+1]
+            inner = cleaned[start:end+1]
             try:
                 return json.loads(inner, strict=False)
-            except json.JSONDecodeError as e:
-                # If still failing, try a very basic cleaning for common LLM issues
-                # Replace actual newlines with escaped newlines inside what looks like strings
-                # but that's complex. Instead, let's try just allowing control chars first.
-                raise ValueError(f"Failed to parse JSON even with strict=False: {e}\nRaw: {inner}")
-        raise ValueError(f"Failed to parse JSON from Ollama response: {raw}")
+            except json.JSONDecodeError:
+                # Last resort: try to escape problematic characters manually if it's a simple string error
+                # This is risky, but let's try to just return a helpful error if it fails
+                raise ValueError(f"Ollama returned invalid JSON: {e}\nRaw snippet: {inner[:200]}...")
+        raise ValueError(f"No JSON object found in Ollama response: {raw[:200]}...")

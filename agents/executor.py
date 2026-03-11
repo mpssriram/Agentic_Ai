@@ -3,13 +3,19 @@ import json
 import re
 import yaml
 import requests
+import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import langchain  # debug control for LangChain network activity
+
 from langchain_community.agent_toolkits.openapi.toolkit import OpenAPIToolkit
 from langchain_community.utilities.requests import RequestsWrapper
 from langchain_community.agent_toolkits.openapi.base import create_openapi_agent
 from langchain_community.tools.json.tool import JsonSpec
 from ollama_client import ollama_chat
+
+# show raw HTTP traffic from LangChain/OpenAPI toolkit
+langchain.debug = True
 
 
 try:
@@ -67,6 +73,19 @@ def _invoke_agent(agent, prompt: str, cb: _AgentLogCapture):
     for fn in attempts:
         try:
             return fn()
+        except requests.HTTPError as e:
+            # log the response text and payload if available
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                print("[DEBUG] HTTPError during agent tool call:")
+                print(f"Status: {resp.status_code}")
+                print(f"Response text: {resp.text}")
+                try:
+                    print("Request body:", resp.request.body)
+                except Exception:
+                    pass
+            last_error = e
+            continue
         except Exception as e:
             last_error = e
             continue
@@ -97,8 +116,36 @@ def fetch_customer_cohort_fresh(*, spec_path: str = "superbfsi_api_spec.yaml") -
     url = f"{base_url}/api/v1/get_customer_cohort"
     headers = {"Content-Type": "application/json", "X-API-Key": api_key}
 
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
+    # network calls can be flaky; retry a few times with exponential backoff
+    resp = None
+    for attempt in range(3):
+        try:
+            print(f"[INFO] Fetching cohort from {url} (attempt {attempt+1})...")
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            break
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
+            if attempt < 2:
+                print(f"[WARN] timeout fetching cohort (attempt {attempt+1}), retrying...")
+                time.sleep(2 ** attempt)
+                continue
+            else:
+                print("[ERROR] network read timeout after all attempts.")
+        except requests.RequestException as e:
+            if attempt < 2:
+                print(f"[WARN] error fetching cohort (attempt {attempt+1}): {e}; retrying...")
+                time.sleep(2 ** attempt)
+                continue
+            else:
+                print(f"[ERROR] request error after all attempts: {e}")
+
+    if resp is None:
+        if os.path.exists("mock_cohort.json"):
+            print("[INFO] Fallback: loading mock_cohort.json due to API failure.")
+            with open("mock_cohort.json", "r") as f:
+                return json.load(f)
+        raise RuntimeError("Failed to fetch customer cohort and no local mock available.")
+
     payload = resp.json()
 
     if isinstance(payload, list):
@@ -244,8 +291,19 @@ def _send_campaign_direct(
         "send_time": send_time,
     }
 
-    resp = requests.post(url, headers=headers, json=payload, timeout=45)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=45)
+        resp.raise_for_status()
+    except requests.HTTPError as err:
+        # expose raw API response and payload for debugging
+        resp = getattr(err, "response", None)
+        if resp is not None:
+            print("[DEBUG] HTTPError during send_campaign")
+            print(f"Status: {resp.status_code}")
+            print(f"Response text: {resp.text}")
+        print("[DEBUG] Payload sent:", json.dumps(payload))
+        raise
+
     try:
         data = resp.json()
     except Exception:
@@ -263,7 +321,7 @@ def execute_campaign_batched(
     *,
     customer_ids: list[str],
     send_time: str | None = None,
-    batch_size: int = 250,
+    batch_size: int = 200,  # default to 200 per batch to handle ~1000 cohort
 ) -> dict:
     if not customer_ids:
         return {"success": False, "campaign_ids": [], "logs": "No customer_ids provided"}
@@ -359,7 +417,23 @@ def execute_campaign(
         audience_str = ", ".join(audience)
 
         headers = {"Content-Type": "application/json", "X-API-Key": api_key}
-        requests_wrapper = RequestsWrapper(headers=headers)
+        # wrap requests in a debug-aware subclass to log errors
+        class DebugRequestsWrapper(RequestsWrapper):
+            def request(self, method, url, **kwargs):
+                resp = super().request(method, url, **kwargs)
+                try:
+                    resp.raise_for_status()
+                except requests.HTTPError as err:
+                    print("[DEBUG] HTTPError in RequestsWrapper")
+                    print(f"URL: {url} method: {method}")
+                    print(f"Status code: {resp.status_code}")
+                    print(f"Response text: {resp.text}")
+                    payload = kwargs.get("json") or kwargs.get("data") or kwargs.get("params")
+                    print("Payload:", payload)
+                    raise
+                return resp
+
+        requests_wrapper = DebugRequestsWrapper(headers=headers)
         json_spec = JsonSpec(dict_=raw_spec, max_value_length=4000)
 
         # Use a minimal LangChain-compatible wrapper for Ollama
@@ -418,12 +492,15 @@ def execute_campaign(
         Your task is to:
         1. Use the GET /api/v1/get_customer_cohort endpoint to fetch the full customer list.
         2. Filter the cohort based on the target audience strategy: "{audience_str}" and extract customer_id.
+           **DO NOT** artificially truncate the list to just two customers; the full cohort
+           (up to ~1000 IDs) must be included.
         3. Use the POST /api/v1/send_campaign endpoint to schedule the campaign for the final list of customer IDs.
+           If the list is very large, split it into batches of about 200 IDs each before sending.
 
         POST body parameters:
         - subject: "{content.get('subject', '')}"
         - body: "{body_with_cta}"
-        - list_customer_ids: [the final list of customer_ids (pre-approved if provided)]
+        - list_customer_ids: [the full final list of customer_ids (pre-approved if provided)]
         - send_time: "{send_time}"
 
         CRITICAL: The send_time MUST be exactly "{send_time}".
@@ -435,8 +512,21 @@ def execute_campaign(
         cb = _AgentLogCapture()
 
         def _run():
-            response = _invoke_agent(agent, prompt, cb)
-            return response.get("output", str(response))
+            try:
+                response = _invoke_agent(agent, prompt, cb)
+                return response.get("output", str(response))
+            except requests.HTTPError as e:
+                # duplicate logging here just in case
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    print("[DEBUG] HTTPError in _run:")
+                    print(f"Status: {resp.status_code}")
+                    print(f"Response text: {resp.text}")
+                    try:
+                        print("Request body:", resp.request.body)
+                    except Exception:
+                        pass
+                raise
 
         with ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(_run)
