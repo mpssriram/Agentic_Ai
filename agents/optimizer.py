@@ -86,7 +86,7 @@ def _spec_base_url(raw_spec: dict) -> str:
 
 def _make_llm(*, google_api_key: str, temperature: float):
     kwargs = {
-        "model": "gemini-2.5-flash",
+        "model": "gemini-2.0-flash",
         "temperature": temperature,
         "google_api_key": google_api_key,
     }
@@ -96,25 +96,25 @@ def _make_llm(*, google_api_key: str, temperature: float):
         return ChatGoogleGenerativeAI(**kwargs)
 
 
-class OptimizedEmail(BaseModel):
-    sentiment_analysis: str = Field(description="A short analysis of the original email's tone and what to change")
-    subject: str = Field(description="The newly optimized email subject line with engaging emojis")
-    body: str = Field(description="The newly optimized email body with emojis, **bolding** for emphasis, and a stronger Call-To-Action (CTA)")
+class OptimizedVariant(BaseModel):
+    segment_name: str = Field(description="Name of the micro-segment")
+    reasoning: str = Field(description="Why this micro-segment was identified")
+    subject: str = Field(description="Optimized subject line for this segment")
+    body: str = Field(description="Optimized body content for this segment with emojis and Markdown font variations")
+
+class OptimizationResult(BaseModel):
+    overall_sentiment: str = Field(description="Analysis of the original campaign performance")
+    micro_segments: list[OptimizedVariant] = Field(description="List of optimized variants for identified micro-segments")
 
 
 def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
     spec_path = "superbfsi_api_spec.yaml"
     if not os.path.exists(spec_path):
-        msg = "superbfsi_api_spec.yaml not found while fetching report. Using zeroed metrics."
-        print(msg)
-        return {"open_rate": 0.0, "click_rate": 0.0}, msg
+        raise FileNotFoundError("superbfsi_api_spec.yaml not found.")
 
     api_key = os.getenv("CAMPAIGNX_API_KEY")
-    api_key = api_key.strip() if api_key else api_key
     if not api_key:
-        msg = "CAMPAIGNX_API_KEY not set while fetching report. Using zeroed metrics."
-        print(msg)
-        return {"open_rate": 0.0, "click_rate": 0.0}, msg
+        raise ValueError("CAMPAIGNX_API_KEY not set.")
 
     with open(spec_path, "r") as f:
         raw_spec = yaml.safe_load(f)
@@ -124,196 +124,62 @@ def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
     json_spec = JsonSpec(dict_=raw_spec, max_value_length=4000)
 
     llm_key = os.environ.get("GOOGLE_API_KEY")
-    llm_key = llm_key.strip() if isinstance(llm_key, str) else llm_key
-    if llm_key == "your_gemini_api_key_here":
-        llm_key = None
-    base_url = _spec_base_url(raw_spec)
-
-    def _fetch_via_http() -> tuple[dict, str]:
-        report_url = f"{base_url}/api/v1/get_report"
-        r = requests.get(
-            report_url,
-            headers=headers,
-            params={"campaign_id": campaign_id},
-            timeout=30,
-        )
-        logs = "\n".join(
-            [
-                "[API MODE] Using direct CampaignX HTTP calls.",
-                f"GET {report_url}?campaign_id=... -> {r.status_code}",
-            ]
-        )
-        try:
-            r.raise_for_status()
-            payload = r.json()
-        except Exception:
-            return {"open_rate": 0.0, "click_rate": 0.0}, logs
-
-        records = []
-        if isinstance(payload, dict):
-            records = payload.get("data", []) or []
-        elif isinstance(payload, list):
-            records = payload
-
-        total = len(records)
-        if total <= 0:
-            return {"open_rate": 0.0, "click_rate": 0.0}, logs
-
-        open_count = sum(1 for rec in records if isinstance(rec, dict) and rec.get("EO") == "Y")
-        click_count = sum(1 for rec in records if isinstance(rec, dict) and rec.get("EC") == "Y")
-        open_rate = round((open_count * 100.0) / total, 2)
-        click_rate = round((click_count * 100.0) / total, 2)
-        return {"open_rate": open_rate, "click_rate": click_rate}, logs
-
-    if not llm_key:
-        metrics, logs = _fetch_via_http()
-        return metrics, "[API MODE] LLM key missing.\n" + logs
+    if not llm_key or llm_key == "your_gemini_api_key_here":
+        raise ValueError("GOOGLE_API_KEY missing for Analytics Agent.")
 
     llm = _make_llm(google_api_key=llm_key, temperature=0)
-    toolkit = OpenAPIToolkit.from_llm(
-        llm=llm,
-        json_spec=json_spec,
-        requests_wrapper=requests_wrapper,
-        allow_dangerous_requests=True,
-    )
+    toolkit = OpenAPIToolkit.from_llm(llm=llm, json_spec=json_spec, requests_wrapper=requests_wrapper, allow_dangerous_requests=True)
+    agent = create_openapi_agent(llm=llm, toolkit=toolkit, allow_dangerous_requests=True, verbose=False, max_iterations=3)
 
-    agent = create_openapi_agent(
-        llm=llm,
-        toolkit=toolkit,
-        allow_dangerous_requests=True,
-        verbose=False,
-        max_iterations=3,
-        max_execution_time=60.0,
-    )
-
-    prompt = f"""
-    You are a performance analytics agent for CampaignX.
-
-    Use the GET /api/v1/get_report endpoint with the query parameter campaign_id={campaign_id} to fetch the complete performance report for this campaign.
-
-    After calling the endpoint, respond only with the raw JSON body returned by the API.
-    """
-
-    print("Running Report Fetch Agent...")
+    prompt = f"Fetch the performance report for campaign_id={campaign_id} using the GET /api/v1/get_report tool. Return the raw JSON."
     cb = _AgentLogCapture()
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(lambda: _invoke_agent(agent, prompt, cb))
             response = future.result(timeout=45)
         output = response.get("output", str(response))
-    except FutureTimeoutError:
-        metrics, logs = _fetch_via_http()
-        return metrics, "[TIMEOUT] OpenAPI agent exceeded 45s. Falling back to direct API mode.\n\n" + logs
-    except Exception:
-        metrics, logs = _fetch_via_http()
-        return metrics, "[FALLBACK] OpenAPI agent failed. Falling back to direct API mode.\n\n" + logs
-    print("Report agent response:", output)
-
-    logs = "\n\n".join([s for s in [cb.text(), output] if s])
-
-    try:
         payload = json.loads(_extract_json_object(output) or output)
-    except Exception:
-        payload = {}
-
-    records = []
-    if isinstance(payload, dict):
         records = payload.get("data", []) or []
-    elif isinstance(payload, list):
-        records = payload
+        total = len(records)
+        if total <= 0:
+            return {"open_rate": 0.0, "click_rate": 0.0}, cb.text()
 
-    total = len(records)
-    if total <= 0:
-        metrics = {"open_rate": 0.0, "click_rate": 0.0}
-        return metrics, logs
-
-    open_count = sum(1 for r in records if r.get("EO") == "Y")
-    click_count = sum(1 for r in records if r.get("EC") == "Y")
-
-    open_rate = round((open_count * 100.0) / total, 2)
-    click_rate = round((click_count * 100.0) / total, 2)
-
-    metrics = {"open_rate": open_rate, "click_rate": click_rate}
-    return metrics, logs
+        open_count = sum(1 for rec in records if rec.get("EO") == "Y")
+        click_count = sum(1 for rec in records if rec.get("EC") == "Y")
+        return {"open_rate": round(open_count*100/total, 2), "click_rate": round(click_count*100/total, 2)}, cb.text()
+    except Exception as e:
+        raise RuntimeError(f"Analytics Agent failed: {e}")
 
 
 def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
     metrics, report_logs = _fetch_metrics_from_report(campaign_id)
-
     click_rate = metrics.get("click_rate", 0.0)
     open_rate = metrics.get("open_rate", 0.0)
-
     performance_score = (click_rate * 0.7) + (open_rate * 0.3)
 
     llm_key = os.environ.get("GOOGLE_API_KEY")
-    llm_key = llm_key.strip() if isinstance(llm_key, str) else llm_key
-    if llm_key == "your_gemini_api_key_here":
-        llm_key = None
-
-    if not llm_key:
-        url = current_content.get("url") or "https://superbfsi.com/xdeposit/explore/"
-        tone = "Positive and engaging"
-        if click_rate < 2 and open_rate >= 10:
-            tone = "Subject seems okay, but CTA and urgency are too weak"
-        elif open_rate < 10:
-            tone = "Not attention-grabbing enough; subject and opening need more energy"
-        elif click_rate >= 5:
-            tone = "Strong performance; keep tone but sharpen CTA"
-
-        sentiment_analysis = (
-            f"Sentiment Analysis: {tone}. "
-            f"Open Rate {open_rate:.2f}% and Click Rate {click_rate:.2f}% suggest adjusting tone/style to improve engagement."
-        )
-        subject = "🔥 XDeposit: Higher Returns, Zero Hassle — Explore Now"
-        body = (
-            "Hello,\n\n"
-            f"**Ready for better returns?** XDeposit is designed to help you grow your savings with confidence.\n\n"
-            "**What’s new in Version 2:**\n"
-            "- More urgency\n"
-            "- Clearer benefits\n"
-            "- Stronger call-to-action\n\n"
-            "**Act now:**\n"
-            f"{url}\n\n"
-            "Regards,\n"
-            "SuperBFSI"
-        )
-
-        return {
-            "performance_score": performance_score,
-            "metrics": metrics,
-            "optimized_content": {
-                "sentiment_analysis": sentiment_analysis,
-                "subject": subject,
-                "body": body,
-            },
-            "logs": report_logs,
-        }
+    if not llm_key or llm_key == "your_gemini_api_key_here":
+         raise ValueError("GOOGLE_API_KEY missing for Optimizer Agent.")
 
     llm = _make_llm(google_api_key=llm_key, temperature=0.7)
-    parser = JsonOutputParser(pydantic_object=OptimizedEmail)
+    parser = JsonOutputParser(pydantic_object=OptimizationResult)
 
     prompt = PromptTemplate(
-        template="""
-        You are an elite marketing optimization agent for CampaignX.
+        template="""You are a performance optimization expert.
         
         Current Campaign Performance:
         - Open Rate: {open_rate}%
         - Click Rate: {click_rate}%
-        - Strict Evaluation Score (70% Click, 30% Open): {performance_score:.2f}
+        - Score (70% Click, 30% Open): {performance_score:.2f}
         
-        Current Email Content:
+        Original Content:
         Subject: {subject}
         Body: {body}
 
-        Step 1 — Sentiment and Tone Analysis:
-        Analyze the original email's tone and style in the context of the performance metrics above.
-        Produce a concise "Sentiment Analysis:" section that explicitly states what is wrong/right with the tone and why it may be hurting opens/clicks
-        (examples: "Too aggressive", "Not urgent enough", "Positive and engaging but CTA is weak", "Too formal for this audience").
-
-        Step 2 — Rewrite using the Analysis:
-        Use your sentiment analysis to adjust the tone and style for the Version 2 email to be more effective.
-        Prioritize improving click rate, while keeping open rate healthy.
-        Apply engaging emojis, **bolding** for emphasis, and a stronger CTA outperforming the original.
+        Task:
+        1. Analyze the performance and provide a sentiment analysis.
+        2. Identify 2-3 micro-segments based on your expertise.
+        3. For each micro-segment, generate an optimized version of the email (subject and body) with emojis and Markdown font variations.
         
         {format_instructions}
         """,
@@ -321,19 +187,15 @@ def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
         partial_variables={"format_instructions": parser.get_format_instructions()},
     )
 
-    chain = prompt | llm | parser
-
     try:
-        print("Running Optimizer Agent...")
-        result = chain.invoke(
-            {
-                "open_rate": open_rate,
-                "click_rate": click_rate,
-                "performance_score": performance_score,
-                "subject": current_content.get("subject", ""),
-                "body": current_content.get("body", ""),
-            }
-        )
+        chain = prompt | llm | parser
+        result = chain.invoke({
+            "open_rate": open_rate,
+            "click_rate": click_rate,
+            "performance_score": performance_score,
+            "subject": current_content.get("subject", ""),
+            "body": current_content.get("body", ""),
+        })
 
         return {
             "performance_score": performance_score,
@@ -342,13 +204,4 @@ def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
             "logs": report_logs,
         }
     except Exception as e:
-        print(f"Error optimizing campaign: {e}")
-        return {
-            "performance_score": performance_score,
-            "metrics": metrics,
-            "optimized_content": {
-                "subject": f"🔥 {current_content.get('subject', 'Update')} - Now Better!",
-                "body": f"**Don't miss out!**\n\n{current_content.get('body', '')}",
-            },
-            "logs": report_logs,
-        }
+        raise RuntimeError(f"Optimization Agent failed: {e}")
