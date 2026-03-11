@@ -4,7 +4,6 @@ import re
 import yaml
 import requests
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_community.agent_toolkits.openapi.toolkit import OpenAPIToolkit
@@ -12,6 +11,33 @@ from langchain_community.utilities.requests import RequestsWrapper
 from langchain_community.agent_toolkits.openapi.base import create_openapi_agent
 from langchain_community.tools.json.tool import JsonSpec
 from pydantic import BaseModel, Field
+from ollama_client import ollama_chat
+from langchain_core.language_models import BaseLanguageModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from typing import Any, List, Optional
+
+class OllamaLangChainWrapper(BaseLanguageModel):
+    def __init__(self, model: str = "qwen2.5-coder:latest", temperature: float = 0.0, max_tokens: int = 2048):
+        super().__init__()
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+    def _generate(self, messages: List[Any], stop: Optional[List[str]] = None, run_manager: Optional[Any] = None, **kwargs: Any) -> Any:
+        ollama_msgs = []
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                ollama_msgs.append({"role": "user", "content": m.content})
+            elif isinstance(m, SystemMessage):
+                ollama_msgs.append({"role": "system", "content": m.content})
+            else:
+                ollama_msgs.append({"role": "user", "content": str(m.content)})
+        text = ollama_chat(ollama_msgs, model=self.model, temperature=self.temperature, max_tokens=self.max_tokens)
+        return type("Generation", (object,), {"text": text})()
+
+    @property
+    def _llm_type(self) -> str:
+        return "ollama"
 
 
 try:
@@ -84,16 +110,6 @@ def _spec_base_url(raw_spec: dict) -> str:
     return "https://campaignx.inxiteout.ai"
 
 
-def _make_llm(*, google_api_key: str, temperature: float):
-    kwargs = {
-        "model": "gemini-2.0-flash",
-        "temperature": temperature,
-        "google_api_key": google_api_key,
-    }
-    try:
-        return ChatGoogleGenerativeAI(**kwargs, convert_system_message_to_human=True)
-    except TypeError:
-        return ChatGoogleGenerativeAI(**kwargs)
 
 
 class OptimizedVariant(BaseModel):
@@ -123,11 +139,7 @@ def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
     requests_wrapper = RequestsWrapper(headers=headers)
     json_spec = JsonSpec(dict_=raw_spec, max_value_length=4000)
 
-    llm_key = os.environ.get("GOOGLE_API_KEY")
-    if not llm_key or llm_key == "your_gemini_api_key_here":
-        raise ValueError("GOOGLE_API_KEY missing for Analytics Agent.")
-
-    llm = _make_llm(google_api_key=llm_key, temperature=0)
+    llm = OllamaLangChainWrapper(temperature=0.0)
     toolkit = OpenAPIToolkit.from_llm(llm=llm, json_spec=json_spec, requests_wrapper=requests_wrapper, allow_dangerous_requests=True)
     agent = create_openapi_agent(llm=llm, toolkit=toolkit, allow_dangerous_requests=True, verbose=False, max_iterations=3)
 
@@ -157,45 +169,36 @@ def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
     open_rate = metrics.get("open_rate", 0.0)
     performance_score = (click_rate * 0.7) + (open_rate * 0.3)
 
-    llm_key = os.environ.get("GOOGLE_API_KEY")
-    if not llm_key or llm_key == "your_gemini_api_key_here":
-         raise ValueError("GOOGLE_API_KEY missing for Optimizer Agent.")
-
-    llm = _make_llm(google_api_key=llm_key, temperature=0.7)
     parser = JsonOutputParser(pydantic_object=OptimizationResult)
 
-    prompt = PromptTemplate(
-        template="""You are a performance optimization expert.
-        
-        Current Campaign Performance:
-        - Open Rate: {open_rate}%
-        - Click Rate: {click_rate}%
-        - Score (70% Click, 30% Open): {performance_score:.2f}
-        
-        Original Content:
-        Subject: {subject}
-        Body: {body}
+    prompt = f"""You are a performance optimization expert.
 
-        Task:
-        1. Analyze the performance and provide a sentiment analysis.
-        2. Identify 2-3 micro-segments based on your expertise.
-        3. For each micro-segment, generate an optimized version of the email (subject and body) with emojis and Markdown font variations.
-        
-        {format_instructions}
-        """,
-        input_variables=["open_rate", "click_rate", "performance_score", "subject", "body"],
-        partial_variables={"format_instructions": parser.get_format_instructions()},
-    )
+Current Campaign Performance:
+- Open Rate: {open_rate}%
+- Click Rate: {click_rate}%
+- Score (70% Click, 30% Open): {performance_score:.2f}
+
+Evaluation Criteria (IMPORTANT):
+- The only scoring criteria is maximizing the TOTAL count of 'EC = Y' (Email Clicked) and 'EO = Y' (Email Opened)
+  from the GET /api/v1/get_report response records.
+- Prioritize improvements that maximize EC (70% weight) and EO (30% weight).
+
+Original Content:
+Subject: {current_content.get('subject', '')}
+Body: {current_content.get('body', '')}
+
+Task:
+1. Analyze the performance with respect to EC and EO outcomes (EC is more important than EO).
+2. Identify 2-3 micro-segments that are most likely to increase EC and EO.
+3. For each micro-segment, generate an optimized version of the email (subject and body) with emojis and Markdown font variations,
+   explicitly designed to increase clicks (EC) first, then opens (EO).
+
+{parser.get_format_instructions()}
+"""
 
     try:
-        chain = prompt | llm | parser
-        result = chain.invoke({
-            "open_rate": open_rate,
-            "click_rate": click_rate,
-            "performance_score": performance_score,
-            "subject": current_content.get("subject", ""),
-            "body": current_content.get("body", ""),
-        })
+        raw = ollama_chat([{"role": "user", "content": prompt}], temperature=0.7, max_tokens=1024)
+        result = parser.parse(raw)
 
         return {
             "performance_score": performance_score,

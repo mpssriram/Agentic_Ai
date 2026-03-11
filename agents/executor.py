@@ -3,12 +3,13 @@ import json
 import re
 import yaml
 import requests
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.agent_toolkits.openapi.toolkit import OpenAPIToolkit
 from langchain_community.utilities.requests import RequestsWrapper
 from langchain_community.agent_toolkits.openapi.base import create_openapi_agent
 from langchain_community.tools.json.tool import JsonSpec
+from ollama_client import ollama_chat
 
 
 try:
@@ -81,19 +82,241 @@ def _spec_base_url(raw_spec: dict) -> str:
     return "https://campaignx.inxiteout.ai"
 
 
-def _make_llm(*, google_api_key: str):
-    kwargs = {
-        "model": "gemini-2.0-flash",
-        "temperature": 0,
-        "google_api_key": google_api_key,
-    }
+def fetch_customer_cohort_fresh(*, spec_path: str = "superbfsi_api_spec.yaml") -> list[dict]:
+    if not os.path.exists(spec_path):
+        raise FileNotFoundError("superbfsi_api_spec.yaml not found.")
+
+    api_key = os.getenv("CAMPAIGNX_API_KEY")
+    if not api_key:
+        raise ValueError("CAMPAIGNX_API_KEY not set.")
+
+    with open(spec_path, "r") as f:
+        raw_spec = yaml.safe_load(f)
+
+    base_url = _spec_base_url(raw_spec)
+    url = f"{base_url}/api/v1/get_customer_cohort"
+    headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    if isinstance(payload, list):
+        cohort = payload
+    elif isinstance(payload, dict):
+        cohort = (
+            payload.get("customers")
+            or payload.get("customer_cohort")
+            or payload.get("data")
+            or payload.get("results")
+        )
+    else:
+        cohort = None
+
+    if not isinstance(cohort, list):
+        raise ValueError("Unexpected get_customer_cohort response shape")
+
+    return [c for c in cohort if isinstance(c, dict)]
+
+
+def _brief_requires_inactive_inclusion(brief: str) -> bool:
+    if not brief:
+        return False
+    b = brief.lower()
+    patterns = [
+        r"\binclude\s+inactive\b",
+        r"\bdon't\s+skip\s+inactive\b",
+        r"\bdo\s+not\s+skip\s+inactive\b",
+        r"\bdont\s+skip\s+inactive\b",
+        r"\bdo\s+not\s+exclude\s+inactive\b",
+        r"\bdon't\s+exclude\s+inactive\b",
+    ]
+    return any(re.search(p, b) for p in patterns)
+
+
+def _customer_search_blob(customer: dict) -> str:
     try:
-        return ChatGoogleGenerativeAI(**kwargs, convert_system_message_to_human=True)
-    except TypeError:
-        return ChatGoogleGenerativeAI(**kwargs)
+        return json.dumps(customer, ensure_ascii=False, default=str).lower()
+    except Exception:
+        return str(customer).lower()
 
 
-def execute_campaign(content: dict, audience: list, send_time: str = None) -> dict:
+def _segment_keywords(segment: str) -> list[str]:
+    if not segment:
+        return []
+    tokens = re.findall(r"[a-z0-9]+", segment.lower())
+    stop = {
+        "and",
+        "or",
+        "the",
+        "a",
+        "an",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "customers",
+        "customer",
+        "users",
+        "user",
+        "segment",
+        "audience",
+    }
+    return [t for t in tokens if t not in stop]
+
+
+def filter_customer_cohort(
+    cohort: list[dict],
+    target_audience: list[str] | None,
+    *,
+    brief: str = "",
+) -> dict:
+    target_audience = target_audience or []
+    include_inactive = _brief_requires_inactive_inclusion(brief)
+
+    matched: list[dict] = []
+    if target_audience:
+        for customer in cohort:
+            blob = _customer_search_blob(customer)
+            for seg in target_audience:
+                kws = _segment_keywords(seg)
+                if kws and all(k in blob for k in kws):
+                    matched.append(customer)
+                    break
+
+    final_customers = matched if matched else list(cohort)
+
+    if include_inactive:
+        inactive_customers = [
+            c
+            for c in cohort
+            if isinstance(c, dict) and bool(c.get("inactive")) is True
+        ]
+        seen = set()
+        merged = []
+        for c in final_customers + inactive_customers:
+            cid = c.get("customer_id") or c.get("id") or c.get("customerId")
+            key = str(cid) if cid is not None else _customer_search_blob(c)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(c)
+        final_customers = merged
+
+    customer_ids: list[str] = []
+    for c in final_customers:
+        cid = c.get("customer_id") or c.get("id") or c.get("customerId")
+        if cid is not None:
+            customer_ids.append(str(cid))
+
+    return {
+        "customers": final_customers,
+        "customer_ids": customer_ids,
+        "include_inactive_guardrail": include_inactive,
+    }
+
+
+def _chunks(items: list[str], size: int) -> list[list[str]]:
+    if size <= 0:
+        raise ValueError("chunk size must be positive")
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _send_campaign_direct(
+    *,
+    raw_spec: dict,
+    api_key: str,
+    subject: str,
+    body: str,
+    list_customer_ids: list[str],
+    send_time: str,
+) -> tuple[str | None, str]:
+    base_url = _spec_base_url(raw_spec)
+    url = f"{base_url}/api/v1/send_campaign"
+    headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+
+    payload = {
+        "subject": subject,
+        "body": body,
+        "list_customer_ids": list_customer_ids,
+        "send_time": send_time,
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=45)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    campaign_id = None
+    if isinstance(data, dict):
+        campaign_id = data.get("campaign_id") or data.get("campaignId") or data.get("id")
+    logs = f"DIRECT POST /send_campaign status={resp.status_code} campaign_id={campaign_id}"
+    return (str(campaign_id) if campaign_id is not None else None, logs)
+
+
+def execute_campaign_batched(
+    content: dict,
+    audience: list,
+    *,
+    customer_ids: list[str],
+    send_time: str | None = None,
+    batch_size: int = 250,
+) -> dict:
+    if not customer_ids:
+        return {"success": False, "campaign_ids": [], "logs": "No customer_ids provided"}
+
+    spec_path = "superbfsi_api_spec.yaml"
+    if not os.path.exists(spec_path):
+        raise FileNotFoundError("superbfsi_api_spec.yaml not found.")
+
+    api_key = os.getenv("CAMPAIGNX_API_KEY")
+    if not api_key:
+        raise ValueError("CAMPAIGNX_API_KEY not set.")
+
+    with open(spec_path, "r") as f:
+        raw_spec = yaml.safe_load(f)
+
+    if not send_time:
+        send_time = (datetime.now() + timedelta(minutes=5)).strftime("%d:%m:%y %H:%M:%S")
+
+    cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
+    body_with_cta = f"{content.get('body', '')}\n\n{cta_url}"
+
+    batches = _chunks([str(x) for x in customer_ids], batch_size)
+    campaign_ids: list[str] = []
+    lines: list[str] = []
+    for i, batch in enumerate(batches, start=1):
+        cid, line = _send_campaign_direct(
+            raw_spec=raw_spec,
+            api_key=api_key,
+            subject=content.get("subject", ""),
+            body=body_with_cta,
+            list_customer_ids=batch,
+            send_time=send_time,
+        )
+        lines.append(f"BATCH {i}/{len(batches)} size={len(batch)} {line}")
+        if cid is not None:
+            campaign_ids.append(cid)
+
+    return {
+        "success": True,
+        "campaign_ids": campaign_ids,
+        "logs": "\n".join(lines).strip(),
+    }
+
+
+
+
+def execute_campaign(
+    content: dict,
+    audience: list,
+    send_time: str = None,
+    *,
+    customer_ids: list[str] | None = None,
+) -> dict:
     """
     Executes the campaign by dynamically discovering and calling the SuperBFSI API
     via LangChain's OpenAPI agent.
@@ -110,22 +333,68 @@ def execute_campaign(content: dict, audience: list, send_time: str = None) -> di
 
     try:
         llm_key = os.environ.get("GOOGLE_API_KEY")
-        if not llm_key or llm_key == "your_gemini_api_key_here":
-            raise ValueError("GOOGLE_API_KEY is not set. Agentic execution requires an LLM.")
 
         with open(spec_path, "r") as f:
             raw_spec = yaml.safe_load(f)
 
-        base_url = _spec_base_url(raw_spec)
-        audience_str = ", ".join(audience)
         if not send_time:
             send_time = (datetime.now() + timedelta(minutes=5)).strftime("%d:%m:%y %H:%M:%S")
+
+        cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
+        body_with_cta = f"{content.get('body', '')}\n\n{cta_url}"
+
+        if customer_ids:
+            campaign_id, direct_logs = _send_campaign_direct(
+                raw_spec=raw_spec,
+                api_key=api_key,
+                subject=content.get("subject", ""),
+                body=body_with_cta,
+                list_customer_ids=customer_ids,
+                send_time=send_time,
+            )
+            return {"success": True, "campaign_id": campaign_id, "logs": direct_logs}
+
+        # No LLM key needed when using Ollama
+        base_url = _spec_base_url(raw_spec)
+        audience_str = ", ".join(audience)
 
         headers = {"Content-Type": "application/json", "X-API-Key": api_key}
         requests_wrapper = RequestsWrapper(headers=headers)
         json_spec = JsonSpec(dict_=raw_spec, max_value_length=4000)
 
-        llm = _make_llm(google_api_key=llm_key)
+        # Use a minimal LangChain-compatible wrapper for Ollama
+        from langchain_core.language_models import BaseLanguageModel
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from typing import Any, List, Optional
+
+        class OllamaLangChainWrapper(BaseLanguageModel):
+            def __init__(self, model: str = "qwen2.5-coder:latest", temperature: float = 0.0, max_tokens: int = 2048):
+                super().__init__()
+                self.model = model
+                self.temperature = temperature
+                self.max_tokens = max_tokens
+
+            def _generate(self, messages: List[Any], stop: Optional[List[str]] = None, run_manager: Optional[Any] = None, **kwargs: Any) -> Any:
+                # Convert LangChain messages to Ollama format
+                ollama_msgs = []
+                for m in messages:
+                    if isinstance(m, HumanMessage):
+                        ollama_msgs.append({"role": "user", "content": m.content})
+                    elif isinstance(m, SystemMessage):
+                        ollama_msgs.append({"role": "system", "content": m.content})
+                    else:
+                        ollama_msgs.append({"role": "user", "content": str(m.content)})
+                text = ollama_chat(ollama_msgs, model=self.model, temperature=self.temperature, max_tokens=self.max_tokens)
+                # Return a minimal generation-like object
+                class Gen:
+                    text = text
+                return type("Generation", (object,), {"text": text})()
+
+            @property
+            def _llm_type(self) -> str:
+                return "ollama"
+
+        llm = OllamaLangChainWrapper(temperature=0.0, max_tokens=2048)
         toolkit = OpenAPIToolkit.from_llm(
             llm=llm,
             json_spec=json_spec,
@@ -142,23 +411,19 @@ def execute_campaign(content: dict, audience: list, send_time: str = None) -> di
             max_execution_time=60.0,
         )
 
-        cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
-        body_with_cta = f"{content.get('body', '')}\n\n{cta_url}"
+        approved_ids_str = ""
         prompt = f"""
         You are an API executor agent for CampaignX.
 
         Your task is to:
         1. Use the GET /api/v1/get_customer_cohort endpoint to fetch the full customer list.
-        2. Filter the cohort based on the target audience strategy: "{audience_str}".
-           - If the strategy specifies certain demographics (e.g., "female senior citizens"), look for relevant fields in the cohort data if available.
-           - If no demographic filtering is possible from the cohort data, use your best judgment or proceed with the relevant segment.
-           - Extract the customer_id for each customer in your filtered list.
-        3. Use the POST /api/v1/send_campaign endpoint to schedule the campaign for your filtered list of customer IDs.
+        2. Filter the cohort based on the target audience strategy: "{audience_str}" and extract customer_id.
+        3. Use the POST /api/v1/send_campaign endpoint to schedule the campaign for the final list of customer IDs.
 
         POST body parameters:
         - subject: "{content.get('subject', '')}"
         - body: "{body_with_cta}"
-        - list_customer_ids: [the filtered list of customer_ids you identified]
+        - list_customer_ids: [the final list of customer_ids (pre-approved if provided)]
         - send_time: "{send_time}"
 
         CRITICAL: The send_time MUST be exactly "{send_time}".

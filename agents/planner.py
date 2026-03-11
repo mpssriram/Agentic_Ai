@@ -1,10 +1,10 @@
 import os
 import json
 from datetime import datetime, timedelta
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
+from ollama_client import ollama_chat
 
 class CampaignPlan(BaseModel):
     strategy: str = Field(description="High-level marketing strategy for the campaign")
@@ -17,38 +17,29 @@ def plan_campaign(brief: str):
     Analyzes the campaign brief using an LLM to generate a marketing strategy,
     target audience, and optimal send time.
     """
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key or api_key == "your_gemini_api_key_here":
-        raise ValueError("GOOGLE_API_KEY is missing or invalid. AI Planner cannot proceed.")
+    current_time_str = (datetime.now() + timedelta(minutes=5)).strftime("%d:%m:%y %H:%M:%S")
+    parser = JsonOutputParser(pydantic_object=CampaignPlan)
+
+    prompt = f"""You are an expert marketing strategist. Analyze the following campaign brief and create a detailed plan.
+
+Campaign Brief: {brief}
+
+Current Time (approx): {current_time_str}
+
+Return a JSON object with the following fields:
+- strategy: A concise marketing approach.
+- target_audience: A list of specific customer segments or descriptors mentioned or inferred.
+- send_time: A recommended send time. It MUST be in the future (at least 5-10 minutes from now). Format strictly as: DD:MM:YY HH:MM:SS. Note: YY should be '26' for 2026.
+- goals: Key metrics to optimize for based on the brief.
+
+{parser.get_format_instructions()}
+"""
 
     try:
-        llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key, temperature=0)
-        parser = JsonOutputParser(pydantic_object=CampaignPlan)
+        raw = ollama_chat([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=512)
+        plan = parser.parse(raw)
 
-        current_time_str = (datetime.now() + timedelta(minutes=5)).strftime("%d:%m:%y %H:%M:%S")
-
-        prompt = PromptTemplate(
-            template="""You are an expert marketing strategist. Analyze the following campaign brief and create a detailed plan.
-
-            Campaign Brief: {brief}
-
-            Current Time (approx): {current_time}
-
-            Return a JSON object with the following fields:
-            - strategy: A concise marketing approach.
-            - target_audience: A list of specific customer segments or descriptors mentioned or inferred.
-            - send_time: A recommended send time. It MUST be in the future (at least 5-10 minutes from now). Format strictly as: DD:MM:YY HH:MM:SS. Note: YY should be '26' for 2026.
-            - goals: Key metrics to optimize for based on the brief.
-
-            {format_instructions}
-            """,
-            input_variables=["brief", "current_time"],
-            partial_variables={"format_instructions": parser.get_format_instructions()},
-        )
-
-        chain = prompt | llm | parser
-        plan = chain.invoke({"brief": brief, "current_time": current_time_str})
-
+        # Minor fix for year formatting if needed
         st = plan.get("send_time", "")
         if st and len(st.split(' ')[0].split(':')[-1]) == 4:
              parts = st.split(' ')

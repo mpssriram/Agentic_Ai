@@ -7,3 +7,4 @@ python-dotenv
 requests
 pydantic
 PyYAML
+openai>=1.0.0
