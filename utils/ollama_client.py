@@ -24,6 +24,7 @@ def ollama_chat(
     base_delay: float = 12.0,
     max_delay: float = 120.0,
     jitter: bool = True,
+    stop: List[str] = None,
 ) -> str:
     """
     Simple wrapper around Ollama's OpenAI-compatible /chat/completions endpoint
@@ -38,6 +39,7 @@ def ollama_chat(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                stop=stop,
             )
             content = resp.choices[0].message.content
             if content is None:
