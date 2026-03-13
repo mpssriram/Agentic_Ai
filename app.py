@@ -403,6 +403,9 @@ if st.session_state.get("campaign_executed"):
                                         msg = f"No customers found for segment '{seg_name}'."
                                         loop_status.update(label=f"⚠️ {msg}", state="error")
                                         st.warning(msg)
+
+                                    if not v_ids:
+                                        continue
                                     else:
                                         # Track history for deltas
                                         loop_history = []

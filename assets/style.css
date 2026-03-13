@@ -32,7 +32,6 @@ section[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
   transform: translateY(-2px) !important;
   box-shadow: 0 8px 24px rgba(99, 102, 241, 0.5) !important;
 }
-
 /* ── All buttons (shared) ─────────────────────────────────────────────────── */
 .stButton > button { border-radius: 10px !important; font-weight: 500 !important; }
 

@@ -141,6 +141,12 @@ class OptimizationResult(BaseModel):
     micro_segments: list[OptimizedVariant] = Field(description="List of optimized variants for identified micro-segments")
 
 
+def _open_first_score(metrics: dict) -> float:
+    open_rate = metrics.get("open_rate", 0.0)
+    click_rate = metrics.get("click_rate", 0.0)
+    return round((open_rate * 0.6) + (click_rate * 0.4), 2)
+
+
 def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
     spec_path = _SPEC_PATH
     if not os.path.exists(spec_path):
@@ -180,11 +186,54 @@ def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
         raise RuntimeError(f"Direct analytics fetch failed: {e}")
 
 
-def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
-    metrics, report_logs = _fetch_metrics_from_report(campaign_id)
+def _aggregate_metrics_from_reports(campaign_ids: list[str]) -> tuple[dict, str]:
+    valid_ids = [str(cid).strip() for cid in campaign_ids if str(cid).strip()]
+    if not valid_ids:
+        return {"open_rate": 0.0, "click_rate": 0.0}, "No campaign IDs provided."
+
+    open_weighted_total = 0.0
+    click_weighted_total = 0.0
+    recipient_total = 0
+    logs: list[str] = []
+
+    for cid in valid_ids:
+        metrics, log_line = _fetch_metrics_from_report(cid)
+        logs.append(f"{cid}: {log_line}")
+
+        recipients = 0
+        m = re.search(r"Found\s+(\d+)\s+records", log_line)
+        if m:
+            recipients = int(m.group(1))
+
+        if recipients <= 0:
+            continue
+
+        recipient_total += recipients
+        open_weighted_total += metrics.get("open_rate", 0.0) * recipients
+        click_weighted_total += metrics.get("click_rate", 0.0) * recipients
+
+    if recipient_total <= 0:
+        return {"open_rate": 0.0, "click_rate": 0.0}, "\n".join(logs) if logs else "Reports fetched but no recipient records found."
+
+    aggregate = {
+        "open_rate": round(open_weighted_total / recipient_total, 2),
+        "click_rate": round(click_weighted_total / recipient_total, 2),
+        "recipient_count": recipient_total,
+        "campaign_count": len(valid_ids),
+    }
+    return aggregate, "\n".join(logs)
+
+
+def optimize_campaign(campaign_id: str | list[str], current_content: dict) -> dict:
+    if isinstance(campaign_id, list):
+        metrics, report_logs = _aggregate_metrics_from_reports(campaign_id)
+        campaign_scope = ", ".join(campaign_id)
+    else:
+        metrics, report_logs = _fetch_metrics_from_report(campaign_id)
+        campaign_scope = campaign_id
     click_rate = metrics.get("click_rate", 0.0)
     open_rate = metrics.get("open_rate", 0.0)
-    performance_score = (click_rate * 0.7) + (open_rate * 0.3)
+    performance_score = _open_first_score(metrics)
 
     from utils.ollama_client import ollama_generate_json
     
@@ -193,12 +242,13 @@ def optimize_campaign(campaign_id: str, current_content: dict) -> dict:
 Current Campaign Performance:
 - Open Rate: {open_rate}%
 - Click Rate: {click_rate}%
-- Score (70% Click, 30% Open): {performance_score:.2f}
+- Open-first Score (60% Open, 40% Click): {performance_score:.2f}
+- Campaign Scope: {campaign_scope}
 
-Evaluation Criteria (IMPORTANT):
-- The only scoring criteria is maximizing the TOTAL count of 'EC = Y' (Email Clicked) and 'EO = Y' (Email Opened)
-  from the GET /api/v1/get_report response records.
-- Prioritize improvements that maximize EC (70% weight) and EO (30% weight).
+Optimization Priorities (IMPORTANT):
+- Diagnose opens first, then clicks.
+- Prioritize improvements that increase open rate via subject-line specificity, relevance, and send-time choice.
+- Then improve click rate through clearer body copy and CTA framing.
 
 Original Content:
 Subject: {current_content.get('subject', '')}
@@ -206,9 +256,9 @@ Body: {current_content.get('body', '')}
 
 Task:
 1. Analyze the performance with respect to EC and EO outcomes (EC is more important than EO).
-2. Identify 2-3 micro-segments that are most likely to increase EC and EO.
-3. For each micro-segment, generate an optimized version of the email (subject and body) with emojis.
-   explicitly designed to increase clicks (EC) first, then opens (EO).
+2. Identify 2-3 micro-segments that are most likely to increase opens and then clicks.
+3. For each micro-segment, generate an optimized version of the email (subject and body).
+   The subject should be explicitly designed to increase opens first.
 4. Recommend an optimized 'send_time' for each segment (e.g., morning for professionals, evening for students). 
    Format: DD:MM:YY HH:MM:SS. Use year 2026.
 
@@ -275,7 +325,7 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
     {current_content.get('body', '')}
 
     Task: Rewrite the email as an expert digital marketer for SuperBFSI’s XDeposit. 
-    You MUST include an emoji in the Subject line, and emojis in the body.
+    Use emojis only when they make the subject or body feel more clickable.
     
     CRITICAL USP RULES (NO MATH, NO CREATIVITY, EXACT MATCH ONLY):
     The body must explicitly mention these three exact phrases Word-for-Word:
@@ -405,7 +455,7 @@ def run_optimization_loop(
         click_rate = metrics.get("click_rate", 0.0)
         _emit(f"📈 Attempt {attempt} metrics — Open: {open_rate}%  Click: {click_rate}%")
 
-        score = (click_rate * 0.7) + (open_rate * 0.3)
+        score = _open_first_score(metrics)
         attempt_record = {
             "attempt":     attempt,
             "campaign_id": campaign_id,

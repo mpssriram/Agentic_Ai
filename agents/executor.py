@@ -98,22 +98,26 @@ def _invoke_agent(agent, prompt: str, cb: _AgentLogCapture):
 def normalize_send_time(val: str | None) -> str:
     """
     Normalizes a send_time string into the format DD:MM:YY HH:MM:SS.
-    Unconditionally returns a time 5 minutes in the past so the mock API
-    instantly grades the campaign as 'delivered'.
+    Preserves deliberate send-time choices when they are valid and future-dated.
+    Falls back to now + 15 minutes only when parsing fails or the value is stale.
     """
     fmt = "%d:%m:%y %H:%M:%S"
-    
-    # Force the time to be 5 minutes in the future using LOCAL time
-    # The server runs in the same timezone (IST) as the local machine.
-    # UTC was causing the time to be 5.5 hours in the past.
-    from datetime import datetime, timedelta
-    imm_time = datetime.now() + timedelta(minutes=5)
-    send_time_str = imm_time.strftime(fmt)
-    
-    print(f"[DEBUG] normalize_send_time: overriding to near-future (now + 5m): {send_time_str}")
-    return send_time_str
-    print(f"[WARN] Failed to normalize send_time '{val}' correctly (even with robust matching), falling back to default '{res}'.")
-    return res
+    now = datetime.now()
+
+    if isinstance(val, str) and val.strip():
+        candidate = val.strip().replace("-", ":").replace("/", ":")
+        try:
+            dt = datetime.strptime(candidate, fmt)
+            if dt > now + timedelta(minutes=10):
+                send_time_str = dt.strftime(fmt)
+                print(f"[DEBUG] normalize_send_time: preserving planned send_time {send_time_str}")
+                return send_time_str
+        except Exception:
+            pass
+
+    fallback = (now + timedelta(minutes=15)).strftime(fmt)
+    print(f"[DEBUG] normalize_send_time: fallback to near-future default {fallback}")
+    return fallback
 
 
 def _spec_base_url(raw_spec: dict) -> str:
@@ -239,6 +243,35 @@ def _segment_keywords(segment: str) -> list[str]:
     return [t for t in tokens if t not in stop]
 
 
+def _is_broad_audience_segment(segment: str) -> bool:
+    if not segment:
+        return False
+    normalized = " ".join(re.findall(r"[a-z0-9]+", segment.lower()))
+    broad_phrases = {
+        "all",
+        "all customers",
+        "all customer",
+        "all users",
+        "everyone",
+        "everyone customers",
+        "entire cohort",
+        "full cohort",
+        "whole cohort",
+        "general audience",
+        "mass audience",
+        "broad audience",
+        "all eligible customers",
+        "all active customers",
+        "all inactive customers",
+    }
+    if normalized in broad_phrases:
+        return True
+
+    broad_tokens = {"all", "everyone", "entire", "whole", "broad", "general", "mass"}
+    tokens = set(re.findall(r"[a-z0-9]+", normalized))
+    return bool(tokens & broad_tokens) and bool(tokens & {"customer", "customers", "user", "users", "cohort", "audience", "eligible", "active", "inactive"})
+
+
 def filter_customer_cohort(
     cohort: list[dict],
     target_audience: list[str] | None,
@@ -247,9 +280,12 @@ def filter_customer_cohort(
 ) -> dict:
     target_audience = target_audience or []
     include_inactive = _brief_requires_inactive_inclusion(brief)
+    broad_match_requested = any(_is_broad_audience_segment(seg) for seg in target_audience)
 
     matched: list[dict] = []
-    if target_audience:
+    if broad_match_requested:
+        matched = list(cohort)
+    elif target_audience:
         for customer in cohort:
             blob = _customer_search_blob(customer)
             for seg in target_audience:
@@ -258,7 +294,12 @@ def filter_customer_cohort(
                     matched.append(customer)
                     break
 
-    final_customers = matched if matched else list(cohort)
+    if matched:
+        final_customers = matched
+    elif target_audience:
+        final_customers = []
+    else:
+        final_customers = list(cohort)
 
     if include_inactive:
         inactive_customers = [
@@ -290,6 +331,9 @@ def filter_customer_cohort(
         "customers": final_customers,
         "customer_ids": customer_ids,
         "include_inactive_guardrail": include_inactive,
+        "match_found": bool(matched),
+        "match_failed_closed": bool(target_audience) and not bool(matched),
+        "broad_match_requested": broad_match_requested,
     }
 
 
