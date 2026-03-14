@@ -134,21 +134,18 @@ def _spec_base_url(raw_spec: dict) -> str:
 
 
 OPTIMIZER_POLICY = {
-    "allowed_url": HACKATHON_POLICY["allowed_url"],
+    "allowed_url": None,
     "click_weight": 0.7,
     "open_weight": 0.3,
     "open_rate_target": 8.0,
     "click_rate_target": 2.0,
     "max_retries": 3,
-    "required_fact_phrases": [
-        "1 percentage point higher returns",
-        "an additional 0.25 percentage point higher returns",
-        "Zero monthly fees",
-    ],
+    "required_fact_phrases": [],
 }
 
 REPORT_POLL_TIMEOUT_SECONDS = 120
 REPORT_POLL_INTERVAL_SECONDS = 5
+REPORT_MAX_POLLS_PER_CAMPAIGN = 10
 
 
 
@@ -163,6 +160,23 @@ class OptimizedVariant(BaseModel):
 class OptimizationResult(BaseModel):
     overall_sentiment: str = Field(description="Short metric-based summary referencing open rate, click rate, and performance score")
     micro_segments: list[OptimizedVariant] = Field(description="List of optimized variants for identified micro-segments")
+
+
+def _product_context_from_content(content: dict) -> dict:
+    product_name = str(content.get("product_name", "") or "").strip()
+    approved_facts = [str(item).strip() for item in (content.get("approved_facts") or []) if str(item).strip()]
+    allowed_urls = [str(item).strip() for item in (content.get("allowed_urls") or []) if str(item).strip()]
+
+    primary_url = str(content.get("url", "") or "").strip()
+    if primary_url and primary_url not in allowed_urls:
+        allowed_urls.insert(0, primary_url)
+
+    return {
+        "product_name": product_name or "the promoted offer",
+        "approved_facts": approved_facts,
+        "allowed_urls": allowed_urls,
+        "primary_url": allowed_urls[0] if allowed_urls else "",
+    }
 
 
 def _campaign_score(metrics: dict) -> float:
@@ -281,13 +295,46 @@ def _aggregate_metrics_from_reports(campaign_ids: list[str], *, poll: bool = Fal
     logs: list[str] = []
 
     fetch_fn = _poll_metrics_from_report if poll else _fetch_metrics_from_report
+    print(f"[DEBUG][REPORT] aggregate_campaign_ids={valid_ids}")
 
-    for cid in valid_ids:
-        metrics, log_line = fetch_fn(cid)
-        logs.append(f"{cid}: {log_line}")
-        total_rows += int(metrics.get("total_rows", metrics.get("recipient_count", 0)) or 0)
-        eo_y_count += int(metrics.get("eo_y_count", 0) or 0)
-        ec_y_count += int(metrics.get("ec_y_count", 0) or 0)
+    if poll and len(valid_ids) > 1:
+        print(f"[DEBUG][REPORT] polling_all_campaign_ids_in_parallel count={len(valid_ids)} max_polls={REPORT_MAX_POLLS_PER_CAMPAIGN}")
+        with ThreadPoolExecutor(max_workers=len(valid_ids)) as executor:
+            futures = {}
+            for index, cid in enumerate(valid_ids, start=1):
+                print(
+                    f"[DEBUG][REPORT] starting_fetch campaign_index={index}/{len(valid_ids)} "
+                    f"campaign_id={cid} mode=poll"
+                )
+                futures[executor.submit(fetch_fn, cid)] = (index, cid)
+
+            for future, (index, cid) in futures.items():
+                metrics, log_line = future.result()
+                print(
+                    f"[DEBUG][REPORT] completed_fetch campaign_index={index}/{len(valid_ids)} campaign_id={cid} "
+                    f"total_rows={metrics.get('total_rows', metrics.get('recipient_count', 0))} "
+                    f"EO_count={metrics.get('eo_y_count', 0)} EC_count={metrics.get('ec_y_count', 0)}"
+                )
+                logs.append(f"{cid}: {log_line}")
+                total_rows += int(metrics.get("total_rows", metrics.get("recipient_count", 0)) or 0)
+                eo_y_count += int(metrics.get("eo_y_count", 0) or 0)
+                ec_y_count += int(metrics.get("ec_y_count", 0) or 0)
+    else:
+        for index, cid in enumerate(valid_ids, start=1):
+            print(
+                f"[DEBUG][REPORT] starting_fetch campaign_index={index}/{len(valid_ids)} "
+                f"campaign_id={cid} mode={'poll' if poll else 'single'}"
+            )
+            metrics, log_line = fetch_fn(cid)
+            print(
+                f"[DEBUG][REPORT] completed_fetch campaign_index={index}/{len(valid_ids)} campaign_id={cid} "
+                f"total_rows={metrics.get('total_rows', metrics.get('recipient_count', 0))} "
+                f"EO_count={metrics.get('eo_y_count', 0)} EC_count={metrics.get('ec_y_count', 0)}"
+            )
+            logs.append(f"{cid}: {log_line}")
+            total_rows += int(metrics.get("total_rows", metrics.get("recipient_count", 0)) or 0)
+            eo_y_count += int(metrics.get("eo_y_count", 0) or 0)
+            ec_y_count += int(metrics.get("ec_y_count", 0) or 0)
 
     if total_rows <= 0:
         return {
@@ -329,6 +376,8 @@ def _poll_metrics_from_report(
     last_error: Exception | None = None
     deadline = time.time() + timeout_seconds
     attempt = 0
+    previous_signature: tuple[int, int, int] | None = None
+    stable_polls = 0
 
     while True:
         attempt += 1
@@ -338,16 +387,38 @@ def _poll_metrics_from_report(
             total_rows = int(metrics.get("total_rows", metrics.get("recipient_count", 0)) or 0)
             eo_count = int(metrics.get("eo_y_count", 0) or 0)
             ec_count = int(metrics.get("ec_y_count", 0) or 0)
+            current_signature = (total_rows, eo_count, ec_count)
+            if current_signature == previous_signature and total_rows > 0:
+                stable_polls += 1
+            else:
+                stable_polls = 0
+            previous_signature = current_signature
             remaining = max(0, int(deadline - time.time()))
-            summary = f"poll_attempt={attempt} total_rows={total_rows} EO_count={eo_count} EC_count={ec_count} remaining_seconds={remaining}"
+            summary = (
+                f"campaign_id={campaign_id} poll_attempt={attempt} total_rows={total_rows} "
+                f"EO_count={eo_count} EC_count={ec_count} stable_polls={stable_polls} remaining_seconds={remaining}"
+            )
             print(f"[DEBUG][REPORT] {summary}")
             logs.append(f"{summary} | {log_line}")
-            if total_rows > 0:
+            if stable_polls >= 1:
+                stop_reason = f"campaign_id={campaign_id} stop_reason=stable_snapshot"
+                print(f"[DEBUG][REPORT] {stop_reason}")
+                logs.append(stop_reason)
+                return latest_metrics, "\n".join(logs)
+            if attempt >= REPORT_MAX_POLLS_PER_CAMPAIGN:
+                stop_reason = f"campaign_id={campaign_id} stop_reason=max_polls_reached"
+                print(f"[DEBUG][REPORT] {stop_reason}")
+                logs.append(stop_reason)
+                return latest_metrics, "\n".join(logs)
+            if remaining <= interval_seconds and total_rows > 0:
+                stop_reason = f"campaign_id={campaign_id} stop_reason=timeout_near"
+                print(f"[DEBUG][REPORT] {stop_reason}")
+                logs.append(stop_reason)
                 return latest_metrics, "\n".join(logs)
         except Exception as e:
             last_error = e
             remaining = max(0, int(deadline - time.time()))
-            summary = f"poll_attempt={attempt} error={e} remaining_seconds={remaining}"
+            summary = f"campaign_id={campaign_id} poll_attempt={attempt} error={e} remaining_seconds={remaining}"
             print(f"[DEBUG][REPORT] {summary}")
             logs.append(summary)
 
@@ -387,7 +458,15 @@ def optimize_campaign(campaign_id: str | list[str], current_content: dict) -> di
         }
 
     from utils.ollama_client import ollama_generate_json
-    
+
+    product_context = _product_context_from_content(current_content)
+    approved_facts_block = "\n".join(
+        f'- "{fact}"' for fact in product_context.get("approved_facts", [])
+    ) or '- No approved product facts were supplied.'
+    allowed_urls_block = "\n".join(
+        f"- {url}" for url in product_context.get("allowed_urls", [])
+    ) or "- No approved URL was supplied."
+
     prompt = f"""You are a performance optimization expert for CampaignX.
 
 Current Campaign Performance:
@@ -435,16 +514,19 @@ Based on the metrics, decide whether the next variant should:
 
 Do not output chain-of-thought or extra commentary outside the required structured response. Apply the reasoning internally and return only the final structured variant.
 
-STRICT FORMATTING RULES FOR VARIANTS:
+Approved product facts you may use:
+{approved_facts_block}
+
+Allowed URLs you may use:
+{allowed_urls_block}
+
+Rules:
 - NO PLACEHOLDERS: NEVER output [Link], [Recipient's Name], etc.
-- CRITICAL USP RULES (NO MATH, EXACT MATCH ONLY): The body must explicitly mention these three exact phrases Word-for-Word:
-  1) "{OPTIMIZER_POLICY['required_fact_phrases'][0]}"
-  2) "{OPTIMIZER_POLICY['required_fact_phrases'][1]}"
-  3) "{OPTIMIZER_POLICY['required_fact_phrases'][2]}"
-  DO NOT simplify or combine to "1.25". DO NOT alter the wording.
+- Use only approved facts already present in the content context.
+- Do not invent rates, fees, pricing, cashback, rewards, or numeric claims.
+- If a URL is included, use only an approved URL from the current content context.
+- Improve click-through rate first while keeping open rate healthy.
 - Keep the format compatible with the current sending flow.
-- Use formatting, emoji, and CTA style only when the metrics suggest they will help.
-- If a URL is included in a variant body, use only the approved CampaignX URL: {OPTIMIZER_POLICY['allowed_url']}
 
 Return ONLY valid JSON exactly matching this structure, with nothing else:
 {{
@@ -486,7 +568,13 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
     Ask the LLM (acting as Creator Agent) to rewrite the email based on
     the performance critique. Returns a new content dict {subject, body, url}.
     """
-    prompt = f"""Act as an elite BFSI marketing copywriter.
+    product_context = _product_context_from_content(current_content)
+    approved_facts = product_context["approved_facts"]
+    allowed_urls = product_context["allowed_urls"]
+    approved_facts_block = "\n".join(f'- "{fact}"' for fact in approved_facts) or '- No approved product facts were supplied.'
+    allowed_urls_block = "\n".join(f"- {url}" for url in allowed_urls) or "- No approved URL was supplied."
+
+    prompt = f"""Act as an elite performance email copywriter for CampaignX.
     
     A previous campaign email had the following performance:
     - Open Rate : {metrics.get('open_rate', 0)}%  (target ≥ {OPEN_RATE_TARGET}%)
@@ -497,26 +585,29 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
     Original Subject: {current_content.get('subject', '')}
     Original Body:
     {current_content.get('body', '')}
+    Task: Rewrite the email as an expert digital marketer for the current promoted offer.
 
-    Task: Rewrite the email as an expert digital marketer for SuperBFSI’s XDeposit. 
     Improve click-through rate first, while keeping opens healthy.
     Make the subject more attractive and professional.
     Make the opening line stronger and more customer-facing.
     Make the body feel worth clicking, not just worth reading.
     Keep the body concise and compatible with the current sending flow.
     Decide adaptively whether emoji, CTA URL style, or lighter formatting will help based on the observed metrics.
+    Use the current campaign product context for {product_context['product_name']}, not any default example product.
     
-    CRITICAL USP RULES (NO MATH, NO CREATIVITY, EXACT MATCH ONLY):
-    The body must explicitly mention these three exact phrases Word-for-Word:
-    - "{OPTIMIZER_POLICY['required_fact_phrases'][0]}"
-    - "{OPTIMIZER_POLICY['required_fact_phrases'][1]}" 
-    - "{OPTIMIZER_POLICY['required_fact_phrases'][2]}"
-    DO NOT simplify to 1.25. DO NOT alter the wording.
+    Approved product facts you may use:
+    {approved_facts_block}
+
+    Allowed URLs you may use:
+    {allowed_urls_block}
     
     STRICT FORMATTING RULES:
     - NO PLACEHOLDERS: NEVER output [Link], [Recipient's Name], [Insert Name], or [URL].
     - NO PREFIXES: Do not output 'Subject:' or 'Body:'. 
     - Keep formatting compatible with the current sending flow and do not assume one fixed presentation style.
+    - Use only approved facts already present in the content context.
+    - Do not invent rates, fees, pricing, cashback, rewards, or numeric claims.
+    - If a URL is included, use only an approved URL from the current content context.
     
     Focus areas when click rate is low:
     - improve CTA wording
@@ -532,15 +623,18 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
     try:
         rewritten = ollama_generate_json(prompt, temperature=0.7, max_tokens=1024)
         
-        raw_url = "https://superbfsi.com/xdeposit/explore/"
+        raw_url = str(current_content.get("url") or product_context["primary_url"] or "").strip()
         body_text = rewritten.get("body", current_content["body"]).strip()
 
         return {
             "subject": rewritten.get("subject", current_content["subject"]),
             "body":    body_text,
             "url":     raw_url,
-            "cta_text": rewritten.get("cta_text", current_content.get("cta_text", "Explore XDeposit")),
+            "cta_text": rewritten.get("cta_text", current_content.get("cta_text", "Review details")),
             "cta_placement": rewritten.get("cta_placement", current_content.get("cta_placement", "end")),
+            "product_name": product_context["product_name"],
+            "approved_facts": approved_facts,
+            "allowed_urls": allowed_urls,
         }
     except Exception as e:
         print(f"[WARN] _rewrite_email failed: {e}")

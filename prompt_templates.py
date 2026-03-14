@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Experimental/secondary prompt stack.
+# This file is not part of the main app.py execution path.
+
 import json
 from copy import deepcopy
 from typing import Any, Mapping

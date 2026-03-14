@@ -14,6 +14,10 @@ from agents.planner import get_planner_prompt, plan_campaign
 
 def wrap_as_html(content: dict) -> str:
     """Wrap the email content in a simple HTML export template."""
+    subject = html.escape(content.get("subject", "No Subject"))
+    body = html.escape(content.get("body", "No Body Content"))
+    url = html.escape(content.get("url", "#"))
+    cta_text = html.escape(content.get("cta_text", "Review details"))
     return f"""
 <!DOCTYPE html>
 <html>
@@ -28,13 +32,42 @@ def wrap_as_html(content: dict) -> str:
 </head>
 <body>
     <div class="header">
-        <div class="subject">{content.get('subject', 'No Subject')}</div>
+        <div class="subject">{subject}</div>
     </div>
-    <div class="body">{content.get('body', 'No Body Content')}</div>
-    <a href="{content.get('url', '#')}" class="cta">Explore now</a>
+    <div class="body">{body}</div>
+    <a href="{url}" class="cta">{cta_text}</a>
 </body>
 </html>
 """
+
+
+def _clear_execution_state() -> None:
+    for key in [
+        "campaign_executed",
+        "optimized_data",
+        "campaign_id",
+        "campaign_ids",
+        "agent_logs",
+        "show_optimizer_technical_details",
+        "execution_in_progress",
+        "optimizer_in_progress",
+        "segment_loop_running",
+        "processed_customer_ids",
+    ]:
+        st.session_state.pop(key, None)
+
+    for key in list(st.session_state.keys()):
+        if key.startswith("loop_results_"):
+            st.session_state.pop(key, None)
+
+    st.session_state["processed_customers"] = 0
+
+
+def _increment_processed_customers(customer_ids: list[str]) -> None:
+    seen = set(st.session_state.get("processed_customer_ids", []))
+    seen.update(str(customer_id) for customer_id in customer_ids if str(customer_id).strip())
+    st.session_state["processed_customer_ids"] = sorted(seen)
+    st.session_state["processed_customers"] = len(seen)
 
 
 def render_summary_card(title: str, value: str, caption: str = "", tone: str = "default") -> None:
@@ -53,31 +86,6 @@ def render_summary_card(title: str, value: str, caption: str = "", tone: str = "
 def render_status_chips(chips: list[str]) -> None:
     chip_html = "".join(f'<span class="status-chip">{html.escape(chip)}</span>' for chip in chips)
     st.markdown(f'<div class="status-chip-row">{chip_html}</div>', unsafe_allow_html=True)
-
-
-def render_live_metric_card(
-    title: str,
-    value: str,
-    caption: str = "",
-    *,
-    dominant: bool = False,
-    badge: str | None = None,
-) -> None:
-    badge_html = f'<div class="live-metric-card__badge">{html.escape(badge)}</div>' if badge else ""
-    dominant_class = " live-metric-card--primary" if dominant else ""
-    st.markdown(
-        f"""
-        <div class="live-metric-card{dominant_class}">
-            <div class="live-metric-card__top">
-                <div class="live-metric-card__title">{html.escape(title)}</div>
-                {badge_html}
-            </div>
-            <div class="live-metric-card__value">{html.escape(value)}</div>
-            <div class="live-metric-card__caption">{html.escape(caption)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def render_section_heading(step: str, title: str, description: str) -> None:
@@ -113,34 +121,6 @@ def render_alert(kind: str, title: str, message: str, details: str | None = None
     if details:
         with st.expander("Technical details"):
             st.code(details)
-
-
-def render_ai_analysis_card(recipient_count: int, open_rate: float, click_rate: float) -> None:
-    st.markdown(
-        f"""
-        <div class="analysis-card">
-            <div class="analysis-card__section">
-                <div class="analysis-card__label">What happened</div>
-                <div class="analysis-card__text">
-                    The campaign achieved a {open_rate:.1f}% open rate and a {click_rate:.1f}% click-through rate across {recipient_count} aggregated recipient records.
-                </div>
-            </div>
-            <div class="analysis-card__section">
-                <div class="analysis-card__label">What matters most</div>
-                <div class="analysis-card__text">
-                    CTR is the primary optimization signal, and current click performance is already strong.
-                </div>
-            </div>
-            <div class="analysis-card__section analysis-card__section--last">
-                <div class="analysis-card__label">Next step</div>
-                <div class="analysis-card__text">
-                    Generate a refined variant that improves CTA clarity while preserving current open performance.
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def render_workflow_sidebar(steps: list[str], current_step: int) -> None:
@@ -179,7 +159,7 @@ def render_landing_page() -> None:
                 <div class="landing-hero__eyebrow">CampaignX for SuperBFSI</div>
                 <h1>AI Marketing Workspace for email campaign execution</h1>
                 <p>
-                    Plan campaigns from a natural-language brief, generate BFSI-safe email content,
+                    Plan campaigns from a natural-language brief, generate email content,
                     review targeting with a human in the loop, execute in batches, and optimize performance
                     with agent-guided recommendations.
                 </p>
@@ -202,8 +182,7 @@ def render_landing_page() -> None:
                 <div class="landing-panel__title">What this project does</div>
                 <div class="landing-panel__body">
                     CampaignX brings the full email workflow into one place: brief intake, campaign planning,
-                    content generation, approval, execution, reporting, and optimization. It is designed for
-                    an India BFSI use case and keeps the final send human-approved.
+                    content generation, approval, execution, reporting, and optimization. The final send remains human-approved.
                 </div>
             </div>
             """,
@@ -295,7 +274,7 @@ def render_landing_page() -> None:
 
     open_col, _ = st.columns([1, 4])
     with open_col:
-        if st.button("Open dashboard", type="primary", use_container_width=True):
+        if st.button("Open dashboard", type="primary", width="stretch"):
             st.session_state["page"] = "workspace"
             st.rerun()
 
@@ -321,7 +300,6 @@ if st.session_state.get("page") == "home":
     render_landing_page()
     st.stop()
 
-
 with st.sidebar:
     st.markdown(
         """
@@ -336,7 +314,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.divider()
-    if st.button("Project overview", use_container_width=True):
+    if st.button("Project overview", width="stretch"):
         st.session_state["page"] = "home"
         st.rerun()
     st.divider()
@@ -379,25 +357,32 @@ with st.sidebar:
     render_workflow_sidebar(steps, current_step)
 
     st.divider()
-    if st.button("Reset workspace", use_container_width=True):
-        for key in [
-            "plan",
-            "content",
-            "step",
-            "brief",
-            "campaign_executed",
-            "optimized_data",
-            "campaign_id",
-            "campaign_ids",
-            "agent_logs",
-            "approved_customer_ids",
-            "approved_customers",
-            "processed_customers",
-            "approval_match_meta",
-        ]:
-            st.session_state.pop(key, None)
+    if st.button("Reset workspace", width="stretch"):
+        for key in list(st.session_state.keys()):
+            if key in {
+                "plan",
+                "content",
+                "step",
+                "brief",
+                "raw_planner_prompt",
+                "approved_customer_ids",
+                "approved_customers",
+                "approval_match_meta",
+                "page",
+            }:
+                continue
+            if key.startswith("loop_results_"):
+                st.session_state.pop(key, None)
+        _clear_execution_state()
+        st.session_state.pop("plan", None)
+        st.session_state.pop("content", None)
+        st.session_state.pop("step", None)
+        st.session_state.pop("brief", None)
+        st.session_state.pop("raw_planner_prompt", None)
+        st.session_state.pop("approved_customer_ids", None)
+        st.session_state.pop("approved_customers", None)
+        st.session_state.pop("approval_match_meta", None)
         st.rerun()
-
 
 st.markdown(
     """
@@ -410,7 +395,7 @@ st.markdown(
         <div class="hero-shell__meta">
             <span class="stat-chip">Email only</span>
             <span class="stat-chip">Human approval</span>
-            <span class="stat-chip">India BFSI</span>
+            <span class="stat-chip">Any campaign brief</span>
         </div>
     </div>
     """,
@@ -438,20 +423,16 @@ with card_2:
 with card_3:
     render_summary_card("Workflow status", workflow_status, "where this campaign stands", tone="violet")
 with card_4:
-    render_summary_card("Processed", str(st.session_state.get("processed_customers", 0)), "customer actions handled", tone="mint")
+    render_summary_card("Processed", str(st.session_state.get("processed_customers", 0)), "unique customers touched", tone="mint")
 
-render_section_heading(
-    "Step 1",
-    "Campaign brief",
-    "",
-)
+render_section_heading("Step 1", "Campaign brief", "")
 
 with st.form("campaign_brief_form", border=False):
     st.caption("Write a short plain-English campaign request. The system will expand it into the full internal prompt.")
     brief = st.text_area(
         "Describe your campaign goal",
         value=st.session_state.get("brief", ""),
-        placeholder="Example: Promote XDeposit to inactive savers and get more clicks.",
+        placeholder="Example: Promote a savings product to inactive customers and improve click-through.",
         height=140,
         key="brief_input",
     )
@@ -472,6 +453,9 @@ if submitted:
                 st.write("Creator is generating the email copy.")
                 content = create_content(plan, brief)
 
+                st.write("Resetting previous execution state for a fresh baseline.")
+                _clear_execution_state()
+
                 st.write("Executor is preparing the campaign payload.")
                 st.session_state.update(
                     {
@@ -488,6 +472,11 @@ if submitted:
 
                 status.update(label="Campaign strategy ready", state="complete", expanded=False)
                 st.toast("Strategy generated successfully", icon="✅")
+                render_alert(
+                    "info",
+                    "Previous execution metrics were cleared",
+                    "Execute this new campaign to generate a new baseline.",
+                )
                 should_rerun = True
             except Exception as exc:
                 status.update(label="Agent workflow stopped", state="error", expanded=True)
@@ -501,7 +490,6 @@ if submitted:
             st.rerun()
     else:
         render_alert("warning", "Brief needed", "Enter a campaign brief before asking the agents to create content.")
-
 
 if "plan" in st.session_state:
     render_section_heading(
@@ -577,14 +565,6 @@ if "plan" in st.session_state:
         st.markdown("**Matched customer list**")
         rows = [
             {
-                "customer_id": customer.get("customer_id") or customer.get("customer id") or customer.get("id") or customer.get("customerId"),
-                "name": customer.get("Full_Name") or customer.get("fullName") or customer.get("name") or "—",
-                "status": customer.get("Social_Media_Active") or customer.get("status") or "—",
-            }
-            for customer in approved_customers
-        ]
-        rows = [
-            {
                 "customer_id": customer.get("customer_id") or customer.get("id") or customer.get("customerId"),
                 "name": customer.get("Full_Name") or customer.get("Full_name") or customer.get("full_name") or customer.get("fullName") or customer.get("name") or customer.get("email") or "-",
                 "city": customer.get("City") or customer.get("city") or "-",
@@ -594,7 +574,7 @@ if "plan" in st.session_state:
             }
             for customer in approved_customers
         ]
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     elif approved_ids:
         render_alert("info", "ID-only audience loaded", f"{len(approved_ids)} matched customers were returned without full profile details.")
     else:
@@ -609,8 +589,10 @@ if "plan" in st.session_state:
         render_alert("warning", "Schema-aware fallback used", message, "\n".join(notes) if notes else None)
 
     approve_col, reject_col, _ = st.columns([1, 1, 4])
+    execution_in_progress = st.session_state.get("execution_in_progress", False)
 
-    if approve_col.button("Approve and execute", type="primary", disabled=not bool(approved_ids)):
+    if approve_col.button("Approve and execute", type="primary", disabled=not bool(approved_ids) or execution_in_progress):
+        st.session_state["execution_in_progress"] = True
         status_box = st.empty()
         progress = st.progress(0)
         total = len(approved_ids)
@@ -624,15 +606,24 @@ if "plan" in st.session_state:
                 end = min((batch_index + 1) * batch_size, total)
                 status_box.info(f"Scheduling batch {batch_index + 1} of {batch_count}")
                 with st.spinner(f"Batch {batch_index + 1} is being scheduled"):
+                    preview = execute_campaign(
+                        content,
+                        plan["target_audience"],
+                        send_time=plan.get("send_time"),
+                        customer_ids=approved_ids[start:end],
+                        approved=False,
+                    )
                     result = execute_campaign(
                         content,
                         plan["target_audience"],
                         send_time=plan.get("send_time"),
                         customer_ids=approved_ids[start:end],
                         approved=True,
+                        approved_proposal=preview.get("validated_proposal"),
                     )
 
                 if not result.get("success"):
+                    st.session_state["execution_in_progress"] = False
                     render_alert(
                         "error",
                         f"Batch {batch_index + 1} could not be scheduled",
@@ -646,8 +637,7 @@ if "plan" in st.session_state:
                 if result.get("logs"):
                     logs.append(f"Batch {batch_index + 1}: {result['logs']}")
 
-                current_processed = st.session_state.get("processed_customers", 0)
-                st.session_state["processed_customers"] = current_processed + (end - start)
+                _increment_processed_customers(approved_ids[start:end])
                 progress.progress(int(((batch_index + 1) / batch_count) * 100))
             else:
                 status_box.success(f"All {batch_count} batches scheduled")
@@ -657,54 +647,61 @@ if "plan" in st.session_state:
                         "campaign_ids": campaign_ids,
                         "campaign_id": campaign_ids[-1] if campaign_ids else None,
                         "agent_logs": "\n".join(logs),
+                        "step": "executed",
                     }
                 )
+                st.session_state["execution_in_progress"] = False
                 st.rerun()
         except Exception as exc:
+            st.session_state["execution_in_progress"] = False
+            error_details = str(exc).strip() or repr(exc)
             render_alert(
                 "error",
                 "Campaign execution stopped",
-                "The send process hit an issue before completion.",
-                str(exc),
+                f"The send process hit an issue before completion. {error_details}",
+                error_details,
             )
 
-    if reject_col.button("Reject"):
+    if reject_col.button("Reject", disabled=execution_in_progress):
         render_alert("warning", "Campaign rejected", "The current draft has been cleared so you can start again with a new brief.")
         for key in [
             "plan",
             "content",
             "step",
-            "campaign_executed",
-            "optimized_data",
-            "campaign_id",
-            "agent_logs",
             "approved_customer_ids",
             "approved_customers",
             "approval_match_meta",
         ]:
             st.session_state.pop(key, None)
+        _clear_execution_state()
         st.rerun()
-
 
 if st.session_state.get("campaign_executed"):
     render_section_heading(
         "Step 3",
         "Live performance and optimization",
-        "Fetch current metrics, inspect the AI analysis, and run segment-level optimization where it is likely to help.",
+        "Fetch baseline campaign metrics, then optimize only through segment-level relaunch flows.",
     )
+
+    st.caption("Baseline metrics below reflect the campaign IDs currently executed in this workspace. If you change planning or content logic, run a new campaign to measure the updated baseline.")
 
     campaign_ids = st.session_state.get("campaign_ids", [])
     if campaign_ids:
         st.caption("Campaign IDs: " + "  ·  ".join(campaign_ids))
 
-    if st.button("Fetch metrics and run optimizer"):
+    optimizer_in_progress = st.session_state.get("optimizer_in_progress", False)
+    if st.button("Fetch metrics and run optimizer", disabled=optimizer_in_progress):
         campaign_scope = campaign_ids or st.session_state.get("campaign_id")
         if campaign_scope:
+            st.session_state["optimizer_in_progress"] = True
             with st.spinner("Analyzing performance and generating micro-segment variants"):
                 try:
                     optimized = optimize_campaign(campaign_scope, st.session_state["content"])
                     st.session_state["optimized_data"] = optimized
+                    st.session_state["optimizer_in_progress"] = False
+                    st.rerun()
                 except Exception as exc:
+                    st.session_state["optimizer_in_progress"] = False
                     render_alert(
                         "error",
                         "Optimizer could not analyze this campaign",
@@ -719,8 +716,12 @@ if st.session_state.get("campaign_executed"):
         metrics = optimized_data.get("metrics", {})
         performance_score = optimized_data.get("performance_score", 0)
         recipient_count = metrics.get("recipient_count", 0)
+        campaign_count = metrics.get("campaign_count", 1)
         open_rate = float(metrics.get("open_rate", 0) or 0)
         click_rate = float(metrics.get("click_rate", 0) or 0)
+
+        st.markdown("**Baseline campaign performance**")
+        st.caption("Baseline metrics and micro-segment relaunch metrics are shown separately.")
 
         render_status_chips(
             [
@@ -732,59 +733,21 @@ if st.session_state.get("campaign_executed"):
 
         metric_1, metric_2, metric_3 = st.columns(3)
         with metric_1:
-            render_live_metric_card("Open Rate", f"{open_rate:.1f}%", "Healthy top-of-funnel engagement")
+            render_summary_card("Open Rate", f"{open_rate:.1f}%", "Baseline across original campaign batches", tone="blue")
         with metric_2:
-            render_live_metric_card(
-                "CTR (Primary Metric)",
-                f"{click_rate:.1f}%",
-                "Primary signal for optimization decisions",
-                dominant=True,
-                badge="PRIMARY METRIC",
-            )
+            render_summary_card("CTR (Primary Metric)", f"{click_rate:.1f}%", "PRIMARY METRIC • Baseline across original campaign batches", tone="violet")
         with metric_3:
-            render_live_metric_card(
-                "Optimization Score",
-                f"{performance_score:.2f}",
-                "Weighted more toward clicks than opens",
-            )
+            render_summary_card("Optimization Score", f"{performance_score:.2f}", "Baseline score weighted more toward clicks than opens", tone="mint")
+
         if recipient_count:
-            st.caption(
-                f"Based on {recipient_count} recipient records aggregated across all campaign batches. CTR is the percentage of recipients who clicked the campaign link."
-            )
+            st.caption(f"Based on {recipient_count} recipient records aggregated across all campaign batches. CTR is the percentage of recipients who clicked the campaign link.")
+            st.caption(f"Aggregated across {campaign_count} campaign ID(s) / batch(es).")
         else:
-            st.caption(
-                "CTR means the percentage of recipients who clicked the campaign link. No report records were available yet, so these values may still be pending."
-            )
+            st.caption("CTR means the percentage of recipients who clicked the campaign link. No report records were available yet, so these values may still be pending.")
 
-        sentiment = optimized_data.get("optimized_content", {}).get("overall_sentiment", "")
-        render_ai_analysis_card(recipient_count, open_rate, click_rate)
+        if st.button("View technical details", width="content"):
+            st.session_state["show_optimizer_technical_details"] = not st.session_state.get("show_optimizer_technical_details", False)
 
-        action_primary, action_secondary = st.columns([1.2, 1], gap="small")
-        with action_primary:
-            if st.button("Generate optimized variant", type="primary", use_container_width=True):
-                campaign_scope = campaign_ids or st.session_state.get("campaign_id")
-                if campaign_scope:
-                    with st.spinner("Generating refined optimized variant"):
-                        try:
-                            optimized = optimize_campaign(campaign_scope, st.session_state["content"])
-                            st.session_state["optimized_data"] = optimized
-                            st.rerun()
-                        except Exception as exc:
-                            render_alert(
-                                "error",
-                                "Optimizer could not analyze this campaign",
-                                "Performance data was not available for optimization right now.",
-                                str(exc),
-                            )
-        with action_secondary:
-            if st.button("View technical details", use_container_width=True):
-                st.session_state["show_optimizer_technical_details"] = not st.session_state.get(
-                    "show_optimizer_technical_details",
-                    False,
-                )
-
-        if sentiment:
-            st.caption(sentiment)
         if st.session_state.get("show_optimizer_technical_details"):
             with st.expander("Technical details", expanded=True):
                 st.code(optimized_data.get("logs", "No technical details available."))
@@ -792,7 +755,7 @@ if st.session_state.get("campaign_executed"):
 
         segments = optimized_data.get("optimized_content", {}).get("micro_segments", [])
         if segments:
-            st.markdown("**Micro-segment variants**")
+            st.markdown("**Micro-segment optimization**")
             for index, segment in enumerate(segments):
                 segment_name = segment.get("segment_name", f"Segment {index + 1}")
                 with st.expander(f"Variant {index + 1}: {segment_name}"):
@@ -802,39 +765,28 @@ if st.session_state.get("campaign_executed"):
                         st.write(f"**Subject:** {segment.get('subject', '')}")
                         st.write("**Body:**")
                         st.markdown(segment.get("body", ""))
+
                     with right:
                         raw_time = segment.get("send_time", "")
-                        try:
-                            from datetime import datetime as dt
-
-                            for fmt in ("%d:%m:%y %H:%M:%S", "%d:%m:%Y %H:%M:%S"):
-                                try:
-                                    parsed = dt.strptime(raw_time, fmt)
-                                    raw_time = parsed.strftime("%d %b %Y · %I:%M %p")
-                                    break
-                                except ValueError:
-                                    continue
-                        except Exception:
-                            pass
-
                         st.write("**Send time**")
                         st.markdown(f"`{raw_time}`")
 
-                        if st.button("Run autonomous optimization", key=f"exec_{index}", use_container_width=True):
+                        segment_loop_running = st.session_state.get("segment_loop_running")
+                        segment_busy = segment_loop_running == index
+
+                        if st.button("Run autonomous optimization", key=f"exec_{index}", width="stretch", disabled=bool(segment_loop_running)):
+                            st.session_state["segment_loop_running"] = index
                             loop_key = f"loop_results_{index}"
                             with st.status(f"Optimizing {segment_name}", expanded=True) as loop_status:
                                 try:
                                     cohort = fetch_customer_cohort_fresh()
-                                    filtered = filter_customer_cohort(cohort, [segment_name])
+                                    filtered = filter_customer_cohort(cohort, [segment_name], brief=st.session_state.get("brief", ""))
                                     variant_ids = filtered.get("customer_ids") or []
 
                                     if not variant_ids:
                                         loop_status.update(label="No matched customers for this segment", state="error")
-                                        render_alert(
-                                            "warning",
-                                            "Segment has no matched customers",
-                                            f"No customers were found for {segment_name}.",
-                                        )
+                                        render_alert("warning", "Segment has no matched customers", f"No customers were found for {segment_name}.")
+                                        st.session_state["segment_loop_running"] = None
                                         continue
 
                                     loop_history: list[dict] = []
@@ -843,10 +795,6 @@ if st.session_state.get("campaign_executed"):
                                         attempt_number = data["attempt"]
                                         loop_metrics = data["metrics"]
                                         loop_score = data["score"]
-
-                                        st.session_state["open_rate"] = loop_metrics["open_rate"]
-                                        st.session_state["click_rate"] = loop_metrics["click_rate"]
-                                        st.session_state["performance_score"] = loop_score
 
                                         open_delta = None
                                         click_delta = None
@@ -857,23 +805,15 @@ if st.session_state.get("campaign_executed"):
                                             click_delta = loop_metrics["click_rate"] - previous["metrics"]["click_rate"]
                                             score_delta = loop_score - previous["score"]
 
-                                        st.markdown(f"#### Attempt {attempt_number}")
+                                        st.markdown("#### Micro-segment relaunch metrics")
+                                        st.caption(f"{segment_name} • attempt {attempt_number}")
                                         progress_col_1, progress_col_2, progress_col_3 = st.columns(3)
-                                        progress_col_1.metric(
-                                            "Open rate",
-                                            f"{loop_metrics['open_rate']}%",
-                                            delta=f"{open_delta:+.2f}%" if open_delta is not None else None,
-                                        )
-                                        progress_col_2.metric(
-                                            "Click rate",
-                                            f"{loop_metrics['click_rate']}%",
-                                            delta=f"{click_delta:+.2f}%" if click_delta is not None else None,
-                                        )
-                                        progress_col_3.metric(
-                                            "Score",
-                                            f"{loop_score:.2f}",
-                                            delta=f"{score_delta:+.2f}" if score_delta is not None else None,
-                                        )
+                                        progress_col_1.metric("Open rate", f"{loop_metrics['open_rate']}%", delta=f"{open_delta:+.2f}%" if open_delta is not None else None)
+                                        progress_col_2.metric("Click rate", f"{loop_metrics['click_rate']}%", delta=f"{click_delta:+.2f}%" if click_delta is not None else None)
+                                        progress_col_3.metric("Score", f"{loop_score:.2f}", delta=f"{score_delta:+.2f}" if score_delta is not None else None)
+                                        recipient_count = loop_metrics.get("recipient_count", loop_metrics.get("total_rows", 0))
+                                        if recipient_count:
+                                            st.caption(f"Campaign `{data.get('campaign_id')}` • {recipient_count} report rows captured for this attempt")
 
                                         if critique:
                                             render_alert("info", "AI insight", critique)
@@ -891,23 +831,20 @@ if st.session_state.get("campaign_executed"):
                                         on_attempt=visual_callback,
                                     )
 
-                                    total_for_loop = len(variant_ids) * len(results.get("attempts", []))
-                                    current_processed = st.session_state.get("processed_customers", 0)
-                                    st.session_state["processed_customers"] = current_processed + total_for_loop
+                                    _increment_processed_customers(variant_ids)
                                     st.session_state[loop_key] = results
+                                    st.session_state["segment_loop_running"] = None
 
                                     if results.get("target_reached"):
                                         loop_status.update(label="Optimization target reached", state="complete", expanded=False)
                                         render_alert("success", "Optimization complete", f"{segment_name} reached the defined target.")
                                     else:
                                         loop_status.update(label="Optimization cycle finished", state="complete", expanded=True)
-                                        render_alert(
-                                            "info",
-                                            "Optimization cycle finished",
-                                            f"Retries ended for {segment_name} before the full target was reached.",
-                                        )
+                                        render_alert("info", "Optimization cycle finished", f"Retries ended for {segment_name} before the full target was reached.")
+
                                     st.rerun()
                                 except Exception as exc:
+                                    st.session_state["segment_loop_running"] = None
                                     loop_status.update(label="Optimization error", state="error")
                                     render_alert(
                                         "error",
@@ -919,14 +856,13 @@ if st.session_state.get("campaign_executed"):
                         loop_result = st.session_state.get(f"loop_results_{index}")
                         if loop_result:
                             with st.expander(f"View optimization logs for {segment_name}", expanded=False):
-                                st.markdown("### Attempt history")
+                                st.markdown("### Micro-segment relaunch metrics")
                                 for attempt in loop_result.get("attempts", []):
                                     st.markdown(f"**Attempt {attempt['attempt']}**")
                                     st.write(f"- Campaign ID: `{attempt.get('campaign_id')}`")
                                     attempt_metrics = attempt.get("metrics", {})
-                                    st.write(
-                                        f"- Open Rate: {attempt_metrics.get('open_rate')}% | Click Rate: {attempt_metrics.get('click_rate')}%"
-                                    )
+                                    st.write(f"- Open Rate: {attempt_metrics.get('open_rate')}% | Click Rate: {attempt_metrics.get('click_rate')}%")
+                                    st.write(f"- Report rows: `{attempt_metrics.get('recipient_count', attempt_metrics.get('total_rows', 0))}`")
                                     st.write(f"- Performance Score: `{attempt.get('score')}`")
                                     st.divider()
 
@@ -942,7 +878,7 @@ if st.session_state.get("campaign_executed"):
                                     data=html_data,
                                     file_name=f"optimized_{segment_name.lower().replace(' ', '_')}.html",
                                     mime="text/html",
-                                    use_container_width=True,
+                                    width="stretch",
                                 )
 
         with st.expander("Execution logs"):

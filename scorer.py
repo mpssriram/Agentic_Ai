@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Experimental/secondary scoring stack.
+# This file is not part of the main app.py execution path.
+
 import re
 from typing import Any, Mapping
 

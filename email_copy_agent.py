@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Experimental/secondary content-generation stack.
+# The main Streamlit app flow uses agents.planner / agents.creator / agents.executor / agents.optimizer.
+
 import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Mapping

@@ -2,7 +2,6 @@ streamlit
 langchain
 langchain-core
 langchain-community
-langchain-google-genai
 python-dotenv
 requests
 pydantic

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Experimental sample runner for the secondary content-generation stack.
+# This file is not part of the main app.py execution path.
+
 import json
 from copy import deepcopy
 

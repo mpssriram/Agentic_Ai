@@ -42,6 +42,13 @@ def _brief_requires_full_cohort(brief: str) -> bool:
     return any(re.search(pattern, b) for pattern in patterns)
 
 
+def _brief_mentions_female_senior_citizens(brief: str) -> bool:
+    if not brief:
+        return False
+    b = brief.lower()
+    return ("female" in b and "senior" in b) or "female senior citizens" in b
+
+
 def _next_send_window(now: datetime | None = None) -> tuple[str, str]:
     now = now or datetime.now()
     candidates = []
@@ -78,6 +85,7 @@ Return a JSON object with the following fields:
 - strategy: A concise marketing approach.
 - target_audience: A list of customer segments or descriptors mentioned or inferred.
   Important rule: if the brief indicates the campaign should include inactive customers or should go broadly, return a broad audience such as ["all customers including inactive customers"] instead of narrowing the cohort.
+  If the brief explicitly mentions subgroups such as female senior citizens, include that subgroup in target_audience so the first-pass message can reflect it.
  - send_time: An engagement-optimized FUTURE send time selected from one of the high-engagement windows above. Format strictly as: DD:MM:YY HH:MM:SS. Note: YY should be '26' for 2026.
 - goals: Key metrics to optimize for based on the brief, prioritizing click-through rate first while maintaining strong open rate.
 
@@ -127,6 +135,16 @@ def plan_campaign(brief: str):
             plan["target_audience"] = ["all customers including inactive customers"]
             strategy = str(plan.get("strategy", "")).strip()
             suffix = " Use the full live cohort and do not exclude inactive customers."
+            if suffix.strip() not in strategy:
+                plan["strategy"] = (strategy + suffix).strip()
+
+        if _brief_mentions_female_senior_citizens(brief):
+            audience = [str(item).strip() for item in plan.get("target_audience", []) if str(item).strip()]
+            if "female senior citizens" not in {item.lower() for item in audience}:
+                audience.append("female senior citizens")
+            plan["target_audience"] = audience or ["female senior citizens"]
+            strategy = str(plan.get("strategy", "")).strip()
+            suffix = " Make the first-pass copy concretely relevant for female senior citizens while remaining suitable for the broader approved cohort."
             if suffix.strip() not in strategy:
                 plan["strategy"] = (strategy + suffix).strip()
 

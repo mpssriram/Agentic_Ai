@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Experimental/secondary validation stack.
+# This file is not part of the main app.py execution path.
+
 import re
 import unicodedata
 from typing import Any, Mapping

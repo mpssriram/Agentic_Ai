@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Quick test script to verify Ollama integration.
-Run this from the repo root: python test_ollama.py
+Run this from the repo root: python tests/test_ollama.py
 """
 
-from ollama_client import ollama_chat, ollama_generate_json
+from utils.ollama_client import ollama_chat, ollama_generate_json
 
 def test_chat():
     print("=== Ollama Chat Test ===")

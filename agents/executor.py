@@ -25,7 +25,7 @@ langchain.debug = True
 
 
 HACKATHON_POLICY = {
-    "allowed_url": "https://superbfsi.com/xdeposit/explore/",
+    "allowed_url": None,
     "allowed_execution_operations": {
         "send_campaign": {
             "method": "POST",
@@ -43,6 +43,8 @@ HACKATHON_POLICY = {
 }
 
 SEND_REQUEST_TIMEOUT_SECONDS = 30
+GREEN_TRACE = "\033[92m"
+TRACE_RESET = "\033[0m"
 
 
 try:
@@ -155,6 +157,10 @@ def _normalize_method(method: str | None) -> str:
     return str(method or "").strip().upper()
 
 
+def _trace(message: str) -> None:
+    print(f"{GREEN_TRACE}[TRACE] {message}{TRACE_RESET}")
+
+
 def _normalize_path(path: str | None) -> str:
     value = str(path or "").strip()
     if not value:
@@ -167,6 +173,18 @@ def _normalize_path(path: str | None) -> str:
 
 def _extract_urls(text: str) -> list[str]:
     return re.findall(r"https?://[^\s<>\"]+", text or "")
+
+
+def _allowed_urls_from_content(content: dict | None) -> list[str]:
+    if not isinstance(content, dict):
+        return []
+    allowed_urls = content.get("allowed_urls")
+    if isinstance(allowed_urls, list):
+        cleaned = [str(url).strip() for url in allowed_urls if str(url).strip()]
+        if cleaned:
+            return cleaned
+    primary_url = str(content.get("url", "") or "").strip()
+    return [primary_url] if primary_url else []
 
 
 def _body_is_english_with_emoji_only(text: str) -> bool:
@@ -252,6 +270,7 @@ def _build_openapi_agent(raw_spec: dict, api_key: str):
 
 
 def _build_send_campaign_proposal_from_spec(*, raw_spec: dict, campaign_context: dict) -> dict:
+    _trace("Reading send_campaign operation from OpenAPI spec")
     send_policy = HACKATHON_POLICY["allowed_execution_operations"]["send_campaign"]
     method = send_policy["method"]
     path = next(iter(send_policy["paths"]))
@@ -284,6 +303,7 @@ def _build_send_campaign_proposal_from_spec(*, raw_spec: dict, campaign_context:
 
 
 def _build_get_report_proposal_from_spec(*, raw_spec: dict, campaign_context: dict) -> dict:
+    _trace("Reading get_report operation from OpenAPI spec")
     report_policy = HACKATHON_POLICY["allowed_report_operations"]["get_report"]
     method = report_policy["method"]
     path = next(iter(report_policy["paths"]))
@@ -322,12 +342,14 @@ def plan_api_call_from_spec(
     """Use the OpenAPI agent to discover and propose the right API call."""
     if action == "send_campaign":
         print("[DEBUG][PLAN] building deterministic send_campaign proposal from spec")
+        _trace("Planning campaign send proposal deterministically from spec")
         return _build_send_campaign_proposal_from_spec(
             raw_spec=raw_spec,
             campaign_context=campaign_context,
         )
     if action == "get_report":
         print("[DEBUG][PLAN] building deterministic get_report proposal from spec")
+        _trace("Planning report fetch proposal deterministically from spec")
         return _build_get_report_proposal_from_spec(
             raw_spec=raw_spec,
             campaign_context=campaign_context,
@@ -389,6 +411,7 @@ def validate_api_call_proposal(
     *,
     raw_spec: dict,
     action: str,
+    allowed_urls: list[str] | None = None,
 ) -> dict:
     """Deterministically validate a discovered API proposal before execution."""
     if not isinstance(proposal, dict):
@@ -429,10 +452,30 @@ def validate_api_call_proposal(
 
         body = str(payload.get("body", ""))
         urls = _extract_urls(body)
-        if any(url != HACKATHON_POLICY["allowed_url"] for url in urls):
+
+        allowed_urls = []
+        proposal_allowed_url = proposal.get("allowed_url")
+        if isinstance(proposal_allowed_url, str) and proposal_allowed_url.strip():
+            allowed_urls.append(proposal_allowed_url.strip())
+
+        proposal_allowed_urls = proposal.get("allowed_urls") or []
+        if isinstance(proposal_allowed_urls, list):
+            allowed_urls.extend(str(item).strip() for item in proposal_allowed_urls if str(item).strip())
+
+        payload_allowed_url = payload.get("allowed_url")
+        if isinstance(payload_allowed_url, str) and payload_allowed_url.strip():
+            allowed_urls.append(payload_allowed_url.strip())
+
+        payload_allowed_urls = payload.get("allowed_urls") or []
+        if isinstance(payload_allowed_urls, list):
+            allowed_urls.extend(str(item).strip() for item in payload_allowed_urls if str(item).strip())
+
+        allowed_urls = list(dict.fromkeys(allowed_urls))
+
+        if allowed_urls and any(url not in allowed_urls for url in urls):
             raise ValueError("Body contains a non-approved URL.")
         if not _body_is_english_with_emoji_only(body):
-            raise ValueError("Body must contain only English text, emoji, and the approved URL.")
+            raise ValueError("Body must contain only English text, emoji, and approved URLs only.")
 
         customer_ids = payload.get("list_customer_ids")
         if not isinstance(customer_ids, list) or not all(isinstance(item, str) and item.strip() for item in customer_ids):
@@ -486,9 +529,14 @@ def execute_validated_api_call(
     print(f"[DEBUG][EXECUTE] resolved_path={path}")
     print(f"[DEBUG][EXECUTE] validated_payload={json.dumps(payload, ensure_ascii=False)}")
     print(f"[DEBUG][EXECUTE] timeout_seconds={timeout_seconds}")
+    print(f"[DEBUG][EXECUTE] request_url={url}")
+    print(f"[DEBUG][EXECUTE] request_method={method}")
+    print(f"[DEBUG][EXECUTE] request_payload={json.dumps(payload, ensure_ascii=False)}")
+    _trace(f"Prepared {method} request for {path}")
 
     try:
         print(f"[DEBUG][EXECUTE] sending_request method={method} url={url}")
+        _trace("Sending live HTTP request to CampaignX")
         if method == "POST":
             response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
         elif method == "GET":
@@ -497,12 +545,13 @@ def execute_validated_api_call(
             raise ValueError(f"Unsupported execution method: {method}")
         print(f"[DEBUG][EXECUTE] received_response status_code={response.status_code}")
         print(f"[DEBUG][EXECUTE] response_text_preview={response.text[:500]}")
+        _trace(f"Received response with status {response.status_code}")
+        response.raise_for_status()
     except requests.RequestException as exc:
         raise RuntimeError(
             f"Campaign send request failed. url={url} timeout={timeout_seconds}s error={exc}"
         ) from exc
 
-    response.raise_for_status()
     response_payload = response.json()
     print(f"[DEBUG][EXECUTE] response_body={json.dumps(response_payload, ensure_ascii=False)}")
     return {
@@ -823,13 +872,13 @@ def _chunks(items: list[str], size: int) -> list[list[str]]:
 
 
 def _cta_render_mode() -> str:
-    mode = os.getenv("CAMPAIGNX_CTA_MODE", "labeled_plain").strip().lower()
-    return mode if mode in {"raw_url", "labeled_plain", "html_anchor"} else "labeled_plain"
+    mode = os.getenv("CAMPAIGNX_CTA_MODE", "raw_url").strip().lower()
+    return mode if mode in {"raw_url", "labeled_plain", "html_anchor"} else "raw_url"
 
 
 def _build_cta_block(cta_text: str, cta_url: str, mode: str) -> str:
     if mode == "raw_url":
-        return cta_url
+        return f"{cta_text}\n{cta_url}"
     if mode == "html_anchor":
         return f'<a href="{cta_url}">{cta_text}</a>'
     return f"{cta_text}: {cta_url}"
@@ -837,10 +886,13 @@ def _build_cta_block(cta_text: str, cta_url: str, mode: str) -> str:
 
 def _compose_body_with_cta(body: str, cta_text: str, cta_url: str, placement: str) -> str:
     body = (body or "").strip()
-    cta_text = (cta_text or "Explore XDeposit").strip()
-    cta_url = (cta_url or "https://superbfsi.com/xdeposit/explore/").strip()
+    cta_text = (cta_text or "Review details").strip()
+    cta_url = (cta_url or "").strip()
     placement = (placement or "end").strip().lower()
     cta_mode = _cta_render_mode()
+
+    if not cta_url:
+        return body
 
     if cta_url in body:
         return body
@@ -893,8 +945,8 @@ def execute_campaign_batched(
     # normalize send_time
     send_time = normalize_send_time(send_time)
 
-    cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
-    cta_text = content.get("cta_text", "Explore XDeposit")
+    cta_url = content.get("url", "")
+    cta_text = content.get("cta_text") or "Review details"
     cta_placement = content.get("cta_placement", "end")
     body = content.get('body', '') or ''
     if "[Mandatory URL]" in body:
@@ -946,6 +998,7 @@ def execute_campaign(
     customer_ids: list[str] | None = None,
     use_agent: bool = True,  # default to agentic behavior
     approved: bool | None = None,
+    approved_proposal: dict | None = None,
 ) -> dict:
     """
     Executes the campaign in an "agentic" manner while retaining strict
@@ -975,8 +1028,8 @@ def execute_campaign(
     # compute or normalize send_time
     send_time = normalize_send_time(send_time)
 
-    cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
-    cta_text = content.get("cta_text", "Explore XDeposit")
+    cta_url = content.get("url", "")
+    cta_text = content.get("cta_text") or "Review details"
     cta_placement = content.get("cta_placement", "end")
     body = content.get('body', '') or ''
     if "[Mandatory URL]" in body:
@@ -997,6 +1050,17 @@ def execute_campaign(
         raise ValueError("customer_ids must be a list of strings")
 
     planning_customer_ids = [str(x) for x in (customer_ids or [])]
+    allowed_urls = []
+    content_url = str(content.get("url", "") or "").strip()
+    if content_url:
+        allowed_urls.append(content_url)
+
+    content_allowed_urls = content.get("allowed_urls") or []
+    if isinstance(content_allowed_urls, list):
+        allowed_urls.extend(str(item).strip() for item in content_allowed_urls if str(item).strip())
+
+    allowed_urls = list(dict.fromkeys(allowed_urls))
+
     campaign_context = {
         "action": "send_or_schedule_campaign",
         "subject": content.get("subject", ""),
@@ -1005,26 +1069,43 @@ def execute_campaign(
         "target_audience": audience,
         "send_time": send_time,
         "cta_text": cta_text,
-        "allowed_url": HACKATHON_POLICY["allowed_url"],
+        "allowed_url": allowed_urls[0] if allowed_urls else "",
+        "allowed_urls": allowed_urls,
         "scheduling_equivalent_to_execution": True,
     }
 
-    print("[DEBUG][PLAN] preparing campaign send proposal")
-    proposal = plan_api_call_from_spec(
-        raw_spec=raw_spec,
-        api_key=api_key,
-        action="send_campaign",
-        campaign_context=campaign_context,
-    )
-    print("[DEBUG][PLAN] campaign send proposal ready")
-    proposal_payload = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
-    proposal_payload["subject"] = content.get("subject", "")
-    proposal_payload["body"] = body_with_cta
-    proposal_payload["list_customer_ids"] = planning_customer_ids
-    proposal_payload["send_time"] = send_time
-    proposal["payload"] = proposal_payload
+    if approved_proposal is not None:
+        print("[DEBUG][PLAN] reusing approved campaign proposal")
+        validated = validate_api_call_proposal(
+            approved_proposal,
+            raw_spec=raw_spec,
+            action="send_campaign",
+            allowed_urls=allowed_urls,
+        )
+    else:
+        print("[DEBUG][PLAN] preparing campaign send proposal")
+        proposal = plan_api_call_from_spec(
+            raw_spec=raw_spec,
+            api_key=api_key,
+            action="send_campaign",
+            campaign_context=campaign_context,
+        )
+        print("[DEBUG][PLAN] campaign send proposal ready")
+        proposal_payload = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
+        proposal_payload["subject"] = content.get("subject", "")
+        proposal_payload["body"] = body_with_cta
+        proposal_payload["list_customer_ids"] = planning_customer_ids
+        proposal_payload["send_time"] = send_time
+        proposal["payload"] = proposal_payload
+        proposal["allowed_url"] = allowed_urls[0] if allowed_urls else ""
+        proposal["allowed_urls"] = allowed_urls
+        validated = validate_api_call_proposal(
+            proposal,
+            raw_spec=raw_spec,
+            action="send_campaign",
+            allowed_urls=allowed_urls,
+        )
 
-    validated = validate_api_call_proposal(proposal, raw_spec=raw_spec, action="send_campaign")
     preview = {
         "success": True,
         "approved": bool(approved),
@@ -1041,6 +1122,7 @@ def execute_campaign(
             "summary": validated.get("summary"),
         },
         "payload": validated["payload"],
+        "validated_proposal": validated,
         "logs": validated.get("logs", ""),
     }
 
