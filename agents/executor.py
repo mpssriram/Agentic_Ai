@@ -7,18 +7,42 @@ import time
 import pathlib
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from typing import Any, List, Optional
 import langchain
 
 from langchain_community.utilities.requests import RequestsWrapper
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
+from langchain_core.outputs import ChatResult, ChatGeneration
 from utils.ollama_client import ollama_chat
 
 # Paths resolved relative to this file so they work from any cwd
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 _SPEC_PATH = str(_REPO_ROOT / "data" / "superbfsi_api_spec.yaml")
-_MOCK_PATH = str(_REPO_ROOT / "data" / "mock_cohort.json")
 
 # show raw HTTP traffic from LangChain/OpenAPI toolkit
 langchain.debug = True
+
+
+HACKATHON_POLICY = {
+    "allowed_url": "https://superbfsi.com/xdeposit/explore/",
+    "allowed_execution_operations": {
+        "send_campaign": {
+            "method": "POST",
+            "paths": {"/api/v1/send_campaign"},
+            "required_payload_keys": {"subject", "body", "list_customer_ids", "send_time"},
+        },
+    },
+    "allowed_report_operations": {
+        "get_report": {
+            "method": "GET",
+            "paths": {"/api/v1/get_report"},
+            "required_query_keys": {"campaign_id"},
+        },
+    },
+}
+
+SEND_REQUEST_TIMEOUT_SECONDS = 30
 
 
 try:
@@ -26,6 +50,38 @@ try:
 except Exception:
     class BaseCallbackHandler:  # type: ignore
         pass
+
+
+class OllamaLangChainWrapper(BaseChatModel):
+    model: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+    temperature: float = 0.0
+    max_tokens: int = 2048
+
+    def _generate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Optional[Any] = None, **kwargs: Any) -> ChatResult:
+        if stop is None:
+            stop = []
+        if "Observation:" not in stop:
+            stop.append("Observation:")
+
+        ollama_msgs = []
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                ollama_msgs.append({"role": "user", "content": m.content})
+            elif isinstance(m, SystemMessage):
+                ollama_msgs.append({"role": "system", "content": m.content})
+            elif isinstance(m, AIMessage):
+                ollama_msgs.append({"role": "assistant", "content": m.content})
+            else:
+                ollama_msgs.append({"role": "user", "content": str(m.content)})
+
+        text = ollama_chat(ollama_msgs, model=self.model, temperature=self.temperature, max_tokens=self.max_tokens, stop=stop)
+        message = AIMessage(content=text)
+        generation = ChatGeneration(message=message)
+        return ChatResult(generations=[generation])
+
+    @property
+    def _llm_type(self) -> str:
+        return "ollama"
 
 
 class _AgentLogCapture(BaseCallbackHandler):
@@ -93,6 +149,370 @@ def _invoke_agent(agent, prompt: str, cb: _AgentLogCapture):
             last_error = e
             continue
     raise last_error or RuntimeError("Agent invocation failed")
+
+
+def _normalize_method(method: str | None) -> str:
+    return str(method or "").strip().upper()
+
+
+def _normalize_path(path: str | None) -> str:
+    value = str(path or "").strip()
+    if not value:
+        return ""
+    if value.startswith("http://") or value.startswith("https://"):
+        parsed = requests.utils.urlparse(value)
+        return parsed.path or value
+    return value
+
+
+def _extract_urls(text: str) -> list[str]:
+    return re.findall(r"https?://[^\s<>\"]+", text or "")
+
+
+def _body_is_english_with_emoji_only(text: str) -> bool:
+    if not text or not str(text).strip():
+        return False
+    if re.search(r"<[^>]+>", text):
+        return False
+    if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
+        return False
+    sanitized = re.sub(r"https?://[^\s]+", " ", text)
+    sanitized = re.sub(r"[A-Za-z0-9\s\.,!?:;'\"()\-/&%+\n\r]", " ", sanitized)
+    sanitized = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", " ", sanitized)
+    return not sanitized.strip()
+
+
+def _extract_operation_schema(raw_spec: dict, method: str, path: str) -> dict:
+    return (
+        raw_spec.get("paths", {})
+        .get(path, {})
+        .get(method.lower(), {})
+        if isinstance(raw_spec, dict)
+        else {}
+    )
+
+
+def _required_request_keys_from_spec(raw_spec: dict, method: str, path: str) -> set[str]:
+    operation_schema = _extract_operation_schema(raw_spec, method, path)
+    request_schema = (
+        operation_schema.get("requestBody", {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+    )
+    required = request_schema.get("required", [])
+    return {str(item) for item in required if isinstance(item, str)}
+
+
+def _agent_result_text(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        for key in ("output", "result", "final_answer"):
+            if key in result and isinstance(result[key], str):
+                return result[key]
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _build_openapi_agent(raw_spec: dict, api_key: str):
+    from langchain_community.agent_toolkits.openapi.toolkit import OpenAPIToolkit
+    from langchain_community.tools.json.tool import JsonSpec
+    from langchain_community.agent_toolkits.openapi.base import create_openapi_agent
+
+    headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+    llm = OllamaLangChainWrapper(
+        model=os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
+        temperature=0.0,
+        max_tokens=2048,
+    )
+    json_spec = JsonSpec(dict_=raw_spec, max_value_length=4000)
+    requests_wrapper = RequestsWrapper(headers=headers)
+
+    toolkit = None
+    toolkit_builders = [
+        lambda: OpenAPIToolkit.from_llm(llm=llm, json_spec=json_spec, requests_wrapper=requests_wrapper, allow_dangerous_requests=True),
+        lambda: OpenAPIToolkit.from_llm(llm, json_spec, requests_wrapper, True),
+        lambda: OpenAPIToolkit(llm=llm, json_spec=json_spec, requests_wrapper=requests_wrapper, allow_dangerous_requests=True),
+        lambda: OpenAPIToolkit(llm=llm, json_spec=json_spec, requests_wrapper=requests_wrapper),
+    ]
+    last_toolkit_error: Exception | None = None
+    for builder in toolkit_builders:
+        try:
+            toolkit = builder()
+            break
+        except Exception as exc:
+            last_toolkit_error = exc
+    if toolkit is None:
+        raise RuntimeError(f"Unable to initialize OpenAPI toolkit: {last_toolkit_error}")
+
+    try:
+        return create_openapi_agent(llm=llm, toolkit=toolkit, verbose=True)
+    except TypeError:
+        return create_openapi_agent(llm, toolkit, verbose=True)
+
+
+def _build_send_campaign_proposal_from_spec(*, raw_spec: dict, campaign_context: dict) -> dict:
+    send_policy = HACKATHON_POLICY["allowed_execution_operations"]["send_campaign"]
+    method = send_policy["method"]
+    path = next(iter(send_policy["paths"]))
+    payload = {
+        "subject": str(campaign_context.get("subject", "")),
+        "body": str(campaign_context.get("body", "")),
+        "list_customer_ids": [str(item) for item in (campaign_context.get("customer_ids") or [])],
+        "send_time": normalize_send_time(campaign_context.get("send_time")),
+    }
+    required_keys = _required_request_keys_from_spec(raw_spec, method, path)
+    missing = sorted(required_keys - set(payload.keys()))
+    if missing:
+        raise ValueError(f"Spec-derived send proposal missing required keys: {missing}")
+
+    return {
+        "operation_id": _extract_operation_schema(raw_spec, method, path).get("operationId") or "send_campaign",
+        "method": method,
+        "path": path,
+        "payload": payload,
+        "summary": "Deterministically planned send_campaign from the OpenAPI specification.",
+        "requires_approval": True,
+        "logs": "\n".join(
+            [
+                f"Resolved base URL: {_spec_base_url(raw_spec)}",
+                f"Resolved path: {path}",
+                f"Required keys from spec: {sorted(required_keys)}",
+            ]
+        ),
+    }
+
+
+def _build_get_report_proposal_from_spec(*, raw_spec: dict, campaign_context: dict) -> dict:
+    report_policy = HACKATHON_POLICY["allowed_report_operations"]["get_report"]
+    method = report_policy["method"]
+    path = next(iter(report_policy["paths"]))
+    payload = {
+        "campaign_id": str(campaign_context.get("campaign_id", "")),
+    }
+    required_keys = set(report_policy["required_query_keys"])
+    missing = sorted(required_keys - set(payload.keys()))
+    if missing:
+        raise ValueError(f"Spec-derived report proposal missing required keys: {missing}")
+
+    return {
+        "operation_id": _extract_operation_schema(raw_spec, method, path).get("operationId") or "get_report",
+        "method": method,
+        "path": path,
+        "payload": payload,
+        "summary": "Deterministically planned get_report from the OpenAPI specification.",
+        "requires_approval": True,
+        "logs": "\n".join(
+            [
+                f"Resolved base URL: {_spec_base_url(raw_spec)}",
+                f"Resolved path: {path}",
+                f"Required query keys from spec: {sorted(required_keys)}",
+            ]
+        ),
+    }
+
+
+def plan_api_call_from_spec(
+    *,
+    raw_spec: dict,
+    api_key: str,
+    action: str,
+    campaign_context: dict,
+) -> dict:
+    """Use the OpenAPI agent to discover and propose the right API call."""
+    if action == "send_campaign":
+        print("[DEBUG][PLAN] building deterministic send_campaign proposal from spec")
+        return _build_send_campaign_proposal_from_spec(
+            raw_spec=raw_spec,
+            campaign_context=campaign_context,
+        )
+    if action == "get_report":
+        print("[DEBUG][PLAN] building deterministic get_report proposal from spec")
+        return _build_get_report_proposal_from_spec(
+            raw_spec=raw_spec,
+            campaign_context=campaign_context,
+        )
+
+    print(f"[DEBUG][PLAN] starting OpenAPI agent planning for action={action}")
+    agent = _build_openapi_agent(raw_spec, api_key)
+    cb = _AgentLogCapture()
+    prompt = f"""
+You are planning an API call for the CampaignX hackathon.
+Inspect the full OpenAPI specification using the available OpenAPI tools before proposing an action.
+Do not execute the API call. Return only a strict JSON object with:
+- operation_id
+- method
+- path
+- payload
+- summary
+- requires_approval
+
+Planning goal: {action}
+
+Campaign context:
+{json.dumps(campaign_context, ensure_ascii=False, indent=2)}
+
+Rules:
+- Discover the correct endpoint from the spec. Do not assume an endpoint before inspection.
+- If the action is about send/schedule, propose a campaign-management operation only.
+- For send/schedule proposals, include payload keys subject, body, list_customer_ids, and send_time.
+- For report proposals, include campaign_id in payload for the discovered report operation.
+- requires_approval must be true.
+- Return JSON only.
+"""
+    print(f"[DEBUG][PLAN] invoking OpenAPI agent for action={action}")
+    result = _invoke_agent(agent, prompt, cb)
+    print(f"[DEBUG][PLAN] OpenAPI agent completed for action={action}")
+    result_text = _agent_result_text(result)
+    extracted = _extract_json_object(result_text) or _extract_json_object(cb.text())
+    if not extracted:
+        raise RuntimeError(f"OpenAPI planner did not return JSON. Raw output: {result_text}")
+
+    try:
+        proposal = json.loads(extracted)
+    except Exception as exc:
+        raise RuntimeError(f"OpenAPI planner returned invalid JSON: {result_text}") from exc
+
+    if not isinstance(proposal, dict):
+        raise RuntimeError("OpenAPI planner returned a non-dict proposal.")
+
+    proposal["method"] = _normalize_method(proposal.get("method"))
+    proposal["path"] = _normalize_path(proposal.get("path"))
+    proposal["payload"] = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
+    proposal["requires_approval"] = True
+    proposal["logs"] = cb.text()
+    return proposal
+
+
+def validate_api_call_proposal(
+    proposal: dict,
+    *,
+    raw_spec: dict,
+    action: str,
+) -> dict:
+    """Deterministically validate a discovered API proposal before execution."""
+    if not isinstance(proposal, dict):
+        raise ValueError("API proposal must be a dict.")
+
+    method = _normalize_method(proposal.get("method"))
+    path = _normalize_path(proposal.get("path"))
+    payload = proposal.get("payload")
+    if not method or not path:
+        raise ValueError("API proposal must include method and path.")
+    if not isinstance(payload, dict):
+        raise ValueError("API proposal payload must be a dict.")
+
+    allowed_ops = (
+        HACKATHON_POLICY["allowed_execution_operations"]
+        if action == "send_campaign"
+        else HACKATHON_POLICY["allowed_report_operations"]
+    )
+    matched_name = None
+    matched_policy = None
+    for name, config in allowed_ops.items():
+        if method == config["method"] and path in config["paths"]:
+            matched_name = name
+            matched_policy = config
+            break
+    if matched_policy is None:
+        raise ValueError(f"Proposed operation {method} {path} is not allowed for action={action}.")
+
+    operation_schema = _extract_operation_schema(raw_spec, method, path)
+    if not operation_schema:
+        raise ValueError(f"Proposed operation {method} {path} was not found in the loaded OpenAPI spec.")
+
+    if action == "send_campaign":
+        required_keys = matched_policy["required_payload_keys"] | _required_request_keys_from_spec(raw_spec, method, path)
+        missing = sorted(required_keys - set(payload.keys()))
+        if missing:
+            raise ValueError(f"Proposal payload missing required keys: {missing}")
+
+        body = str(payload.get("body", ""))
+        urls = _extract_urls(body)
+        if any(url != HACKATHON_POLICY["allowed_url"] for url in urls):
+            raise ValueError("Body contains a non-approved URL.")
+        if not _body_is_english_with_emoji_only(body):
+            raise ValueError("Body must contain only English text, emoji, and the approved URL.")
+
+        customer_ids = payload.get("list_customer_ids")
+        if not isinstance(customer_ids, list) or not all(isinstance(item, str) and item.strip() for item in customer_ids):
+            raise ValueError("list_customer_ids must be a list of non-empty strings.")
+
+        normalized_send_time = normalize_send_time(payload.get("send_time"))
+        payload["send_time"] = normalized_send_time
+        if not payload["send_time"]:
+            raise ValueError("send_time is required.")
+
+    else:
+        required_query_keys = matched_policy["required_query_keys"]
+        missing = sorted(required_query_keys - set(payload.keys()))
+        if missing:
+            raise ValueError(f"Report proposal missing required keys: {missing}")
+        if not str(payload.get("campaign_id", "")).strip():
+            raise ValueError("campaign_id is required for report fetching.")
+
+    return {
+        "operation_name": matched_name,
+        "operation_id": proposal.get("operation_id") or operation_schema.get("operationId") or matched_name,
+        "method": method,
+        "path": path,
+        "payload": payload,
+        "summary": str(proposal.get("summary", "")).strip() or str(operation_schema.get("summary", "")).strip(),
+        "requires_approval": True,
+        "logs": str(proposal.get("logs", "")).strip(),
+    }
+
+
+def execute_validated_api_call(
+    *,
+    validated_proposal: dict,
+    raw_spec: dict,
+    api_key: str,
+    approved: bool,
+) -> dict:
+    """Execute a validated proposal only after explicit approval."""
+    if not approved:
+        raise PermissionError("Explicit approval is required before API execution.")
+
+    method = validated_proposal["method"]
+    path = validated_proposal["path"]
+    payload = validated_proposal.get("payload", {})
+    base_url = _spec_base_url(raw_spec)
+    url = f"{base_url}{path}"
+    headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+    timeout_seconds = SEND_REQUEST_TIMEOUT_SECONDS
+
+    print(f"[DEBUG][EXECUTE] resolved_base_url={base_url}")
+    print(f"[DEBUG][EXECUTE] resolved_path={path}")
+    print(f"[DEBUG][EXECUTE] validated_payload={json.dumps(payload, ensure_ascii=False)}")
+    print(f"[DEBUG][EXECUTE] timeout_seconds={timeout_seconds}")
+
+    try:
+        print(f"[DEBUG][EXECUTE] sending_request method={method} url={url}")
+        if method == "POST":
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
+        elif method == "GET":
+            response = requests.get(url, headers=headers, params=payload, timeout=timeout_seconds)
+        else:
+            raise ValueError(f"Unsupported execution method: {method}")
+        print(f"[DEBUG][EXECUTE] received_response status_code={response.status_code}")
+        print(f"[DEBUG][EXECUTE] response_text_preview={response.text[:500]}")
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Campaign send request failed. url={url} timeout={timeout_seconds}s error={exc}"
+        ) from exc
+
+    response.raise_for_status()
+    response_payload = response.json()
+    print(f"[DEBUG][EXECUTE] response_body={json.dumps(response_payload, ensure_ascii=False)}")
+    return {
+        "operation_id": validated_proposal.get("operation_id"),
+        "method": method,
+        "path": path,
+        "payload": payload,
+        "response": response_payload,
+        "campaign_id": response_payload.get("campaign_id") or response_payload.get("campaignId") or response_payload.get("id"),
+    }
 
 
 def normalize_send_time(val: str | None) -> str:
@@ -169,11 +589,7 @@ def fetch_customer_cohort_fresh() -> list[dict]:
                 print(f"[ERROR] request error after all attempts: {e}")
 
     if resp is None:
-        if os.path.exists(_MOCK_PATH):
-            print("[INFO] Fallback: loading mock_cohort.json due to API failure.")
-            with open(_MOCK_PATH, "r") as f:
-                return json.load(f)
-        raise RuntimeError("Failed to fetch customer cohort and no local mock available.")
+        raise RuntimeError("Failed to fetch live customer cohort from CampaignX API after all retry attempts.")
 
     payload = resp.json()
 
@@ -243,6 +659,28 @@ def _segment_keywords(segment: str) -> list[str]:
     return [t for t in tokens if t not in stop]
 
 
+def _is_inactive_segment(segment: str) -> bool:
+    tokens = set(_segment_keywords(segment))
+    return bool(tokens & {"inactive", "dormant", "lapsed"})
+
+
+def _is_active_segment(segment: str) -> bool:
+    tokens = set(_segment_keywords(segment))
+    return bool(tokens & {"active", "engaged", "current"})
+
+
+def _customer_is_inactive(customer: dict) -> bool:
+    return bool(customer.get("inactive")) is True or customer.get("Social_Media_Active") == "N"
+
+
+def _customer_is_active(customer: dict) -> bool:
+    if "inactive" in customer:
+        return not bool(customer.get("inactive"))
+    if "Social_Media_Active" in customer:
+        return customer.get("Social_Media_Active") != "N"
+    return True
+
+
 def _is_broad_audience_segment(segment: str) -> bool:
     if not segment:
         return False
@@ -281,21 +719,58 @@ def filter_customer_cohort(
     target_audience = target_audience or []
     include_inactive = _brief_requires_inactive_inclusion(brief)
     broad_match_requested = any(_is_broad_audience_segment(seg) for seg in target_audience)
+    supported_segments: list[str] = []
+    unsupported_segments: list[str] = []
+    schema_fallback_used = False
+    matching_notes: list[str] = []
 
     matched: list[dict] = []
     if broad_match_requested:
         matched = list(cohort)
+        supported_segments = list(target_audience)
+        matching_notes.append("Broad audience request mapped to the full cohort.")
     elif target_audience:
-        for customer in cohort:
-            blob = _customer_search_blob(customer)
-            for seg in target_audience:
-                kws = _segment_keywords(seg)
-                if kws and all(k in blob for k in kws):
-                    matched.append(customer)
-                    break
+        for seg in target_audience:
+            if _is_inactive_segment(seg):
+                supported_segments.append(seg)
+                matching_notes.append(f'"{seg}" mapped to inactive customers from cohort fields.')
+                matched.extend([customer for customer in cohort if isinstance(customer, dict) and _customer_is_inactive(customer)])
+                continue
+            if _is_active_segment(seg):
+                supported_segments.append(seg)
+                matching_notes.append(f'"{seg}" mapped to active customers from cohort fields.')
+                matched.extend([customer for customer in cohort if isinstance(customer, dict) and _customer_is_active(customer)])
+                continue
+
+            kws = _segment_keywords(seg)
+            sample_blob = _customer_search_blob(cohort[0]) if cohort else ""
+            if kws and any(k in sample_blob for k in kws):
+                supported_segments.append(seg)
+                for customer in cohort:
+                    blob = _customer_search_blob(customer)
+                    if all(k in blob for k in kws):
+                        matched.append(customer)
+                continue
+
+            unsupported_segments.append(seg)
+
+        if not matched and unsupported_segments:
+            matched = list(cohort)
+            schema_fallback_used = True
+            matching_notes.append(
+                "Requested segments could not be matched from the available cohort fields, so the full cohort was used for testing."
+            )
 
     if matched:
-        final_customers = matched
+        seen = set()
+        final_customers = []
+        for customer in matched:
+            cid = customer.get("customer_id") or customer.get("id") or customer.get("customerId")
+            key = str(cid) if cid is not None else _customer_search_blob(customer)
+            if key in seen:
+                continue
+            seen.add(key)
+            final_customers.append(customer)
     elif target_audience:
         final_customers = []
     else:
@@ -334,6 +809,10 @@ def filter_customer_cohort(
         "match_found": bool(matched),
         "match_failed_closed": bool(target_audience) and not bool(matched),
         "broad_match_requested": broad_match_requested,
+        "supported_segments": supported_segments,
+        "unsupported_segments": unsupported_segments,
+        "schema_fallback_used": schema_fallback_used,
+        "matching_notes": matching_notes,
     }
 
 
@@ -343,51 +822,45 @@ def _chunks(items: list[str], size: int) -> list[list[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def _send_campaign_direct(
-    *,
-    raw_spec: dict,
-    api_key: str,
-    subject: str,
-    body: str,
-    list_customer_ids: list[str],
-    send_time: str,
-) -> tuple[str | None, str]:
-    base_url = _spec_base_url(raw_spec)
-    url = f"{base_url}/api/v1/send_campaign"
-    headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+def _cta_render_mode() -> str:
+    mode = os.getenv("CAMPAIGNX_CTA_MODE", "labeled_plain").strip().lower()
+    return mode if mode in {"raw_url", "labeled_plain", "html_anchor"} else "labeled_plain"
 
-    payload = {
-        "subject": subject,
-        "body": body,
-        "list_customer_ids": list_customer_ids,
-        "send_time": send_time,
-    }
-    print(f"[DEBUG] Final payload to /send_campaign: {json.dumps(payload)}")
 
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=45)
-        resp.raise_for_status()
-    except requests.HTTPError as err:
-        # expose raw API response and payload for debugging
-        resp = getattr(err, "response", None)
-        detail = ""
-        if resp is not None:
-            detail = f" | Status: {resp.status_code} | Body: {resp.text}"
-            print("[DEBUG] HTTPError during send_campaign")
-            print(f"Status: {resp.status_code}")
-            print(f"Response text: {resp.text}")
-        print("[DEBUG] Payload sent:", json.dumps(payload))
-        raise RuntimeError(f"{err}{detail}") from err
+def _build_cta_block(cta_text: str, cta_url: str, mode: str) -> str:
+    if mode == "raw_url":
+        return cta_url
+    if mode == "html_anchor":
+        return f'<a href="{cta_url}">{cta_text}</a>'
+    return f"{cta_text}: {cta_url}"
 
-    try:
-        data = resp.json()
-    except Exception:
-        data = {}
-    campaign_id = None
-    if isinstance(data, dict):
-        campaign_id = data.get("campaign_id") or data.get("campaignId") or data.get("id")
-    logs = f"DIRECT POST /send_campaign status={resp.status_code} campaign_id={campaign_id}"
-    return (str(campaign_id) if campaign_id is not None else None, logs)
+
+def _compose_body_with_cta(body: str, cta_text: str, cta_url: str, placement: str) -> str:
+    body = (body or "").strip()
+    cta_text = (cta_text or "Explore XDeposit").strip()
+    cta_url = (cta_url or "https://superbfsi.com/xdeposit/explore/").strip()
+    placement = (placement or "end").strip().lower()
+    cta_mode = _cta_render_mode()
+
+    if cta_url in body:
+        return body
+
+    if placement not in {"start", "middle", "end"}:
+        placement = "end"
+
+    cta_block = _build_cta_block(cta_text, cta_url, cta_mode)
+    paragraphs = [part.strip() for part in body.split("\n\n") if part.strip()]
+
+    if not paragraphs:
+        return cta_block
+
+    if placement == "start":
+        return "\n\n".join([cta_block, *paragraphs])
+    if placement == "middle":
+        middle_index = max(1, len(paragraphs) // 2)
+        merged = paragraphs[:middle_index] + [cta_block] + paragraphs[middle_index:]
+        return "\n\n".join(merged)
+    return "\n\n".join([*paragraphs, cta_block])
 
 
 def execute_campaign_batched(
@@ -396,6 +869,7 @@ def execute_campaign_batched(
     *,
     customer_ids: list[str],
     send_time: str | None = None,
+    approved: bool = False,
     batch_size: int = 200,  # default to 200 per batch to handle ~1000 cohort
 ) -> dict:
     if not customer_ids:
@@ -420,34 +894,46 @@ def execute_campaign_batched(
     send_time = normalize_send_time(send_time)
 
     cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
+    cta_text = content.get("cta_text", "Explore XDeposit")
+    cta_placement = content.get("cta_placement", "end")
     body = content.get('body', '') or ''
     if "[Mandatory URL]" in body:
         body = body.replace("[Mandatory URL]", cta_url)
-    elif cta_url not in body:
-        body = f"{body}\n\n{cta_url}"
-    body_with_cta = body
+    body_with_cta = _compose_body_with_cta(body, cta_text, cta_url, cta_placement)
 
     batches = _chunks([str(x) for x in customer_ids], batch_size)
     campaign_ids: list[str] = []
     lines: list[str] = []
+    previews: list[dict] = []
     for i, batch in enumerate(batches, start=1):
-        cid, line = _send_campaign_direct(
-            raw_spec=raw_spec,
-            api_key=api_key,
-            subject=content.get("subject", ""),
-            body=body_with_cta,
-            list_customer_ids=batch,
+        batch_content = dict(content)
+        batch_content["body"] = body_with_cta
+        result = execute_campaign(
+            batch_content,
+            audience,
             send_time=send_time,
+            customer_ids=batch,
+            use_agent=True,
+            approved=approved,
         )
-        lines.append(f"BATCH {i}/{len(batches)} size={len(batch)} {line}")
-        if cid is not None:
-            campaign_ids.append(cid)
+        if not approved:
+            previews.append({"batch": i, **result})
+            lines.append(f"BATCH {i}/{len(batches)} size={len(batch)} preview_ready")
+            continue
+        lines.append(f"BATCH {i}/{len(batches)} size={len(batch)} {result.get('logs', '')}".strip())
+        if result.get("campaign_id") is not None:
+            campaign_ids.append(str(result["campaign_id"]))
 
-    return {
+    response = {
         "success": True,
         "campaign_ids": campaign_ids,
         "logs": "\n".join(lines).strip(),
     }
+    if not approved:
+        response["approved"] = False
+        response["preview_batches"] = previews
+        response["preview"] = previews[0] if previews else None
+    return response
 
 
 
@@ -459,15 +945,15 @@ def execute_campaign(
     *,
     customer_ids: list[str] | None = None,
     use_agent: bool = True,  # default to agentic behavior
+    approved: bool | None = None,
 ) -> dict:
     """
     Executes the campaign in an "agentic" manner while retaining strict
     validation of what eventually gets sent to the API.
 
-    By default the Ollama/OpenAPI agent is consulted to plan the campaign
-    payload (i.e. compute customer_ids and construct the request body).  The
-    actual HTTP request is performed locally by `_send_campaign_direct`, which
-    allows us to check the JSON before sending and thus avoid hidden 422 errors.
+    The send path is spec-driven and deterministic for hackathon stability:
+    it reads the OpenAPI spec, validates the required payload shape, and only
+    executes after approval using a direct HTTP request.
 
     If `use_agent` is set to False the agent is skipped entirely and a simple
     cohort fetch/filter is performed, as a fallback for testing or when the
@@ -490,127 +976,91 @@ def execute_campaign(
     send_time = normalize_send_time(send_time)
 
     cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
+    cta_text = content.get("cta_text", "Explore XDeposit")
+    cta_placement = content.get("cta_placement", "end")
     body = content.get('body', '') or ''
     if "[Mandatory URL]" in body:
         body = body.replace("[Mandatory URL]", cta_url)
-    elif cta_url not in body:
-        body = f"{body}\n\n{cta_url}"
-    body_with_cta = body
+    body_with_cta = _compose_body_with_cta(body, cta_text, cta_url, cta_placement)
 
     # determine the list of customer IDs to send to if not provided
-    # when customer_ids is not pre-specified, let the agent compute them
-    if customer_ids is None and use_agent:
-        # the agent will be responsible for cohort filtering as well
-        pass  # this is handled in the payload generation below
-    elif customer_ids is None:
+    if customer_ids is None:
         cohort = fetch_customer_cohort_fresh()
         filtered = filter_customer_cohort(cohort, audience, brief="")
         customer_ids = filtered.get("customer_ids") or []
         print(f"[DEBUG] execute_campaign determined {len(customer_ids)} ids")
 
-    if not customer_ids and not use_agent:
+    if not customer_ids:
         return {"success": False, "logs": "No customer_ids provided after filtering"}
 
     if customer_ids and (not isinstance(customer_ids, list) or not all(isinstance(x, str) for x in customer_ids)):
         raise ValueError("customer_ids must be a list of strings")
 
-    if not use_agent or customer_ids is not None:
-        # send directly in batches (helper validates again)
-        res = execute_campaign_batched(
-            content,
-            audience,
-            customer_ids=customer_ids or [],
-            send_time=send_time,
-        )
-        # for backward compatibility with single-batch expectations in app.py
-        if res.get("success") and res.get("campaign_ids"):
-            res["campaign_id"] = res["campaign_ids"][0]
-        return res
+    planning_customer_ids = [str(x) for x in (customer_ids or [])]
+    campaign_context = {
+        "action": "send_or_schedule_campaign",
+        "subject": content.get("subject", ""),
+        "body": body_with_cta,
+        "customer_ids": planning_customer_ids,
+        "target_audience": audience,
+        "send_time": send_time,
+        "cta_text": cta_text,
+        "allowed_url": HACKATHON_POLICY["allowed_url"],
+        "scheduling_equivalent_to_execution": True,
+    }
 
-    # --- agentic path: ask the LLM to craft the payload we will send ---
-    print("[INFO] execute_campaign running agentic payload-generator path")
-
-    # ensure necessary agent imports are available at runtime
-    try:
-        from langchain_community.agent_toolkits.openapi.toolkit import OpenAPIToolkit
-        from langchain_community.tools.json.tool import JsonSpec
-        from langchain_community.agent_toolkits.openapi.base import create_openapi_agent
-    except ImportError as imp_err:
-        raise RuntimeError("Agent dependencies missing; cannot run use_agent=True") from imp_err
-
-    cta_url = content.get("url", "https://superbfsi.com/xdeposit/explore/")
-    body = content.get('body', '') or ''
-    if "[Mandatory URL]" in body:
-        body = body.replace("[Mandatory URL]", cta_url)
-    elif cta_url not in body:
-        body = f"{body}\n\n{cta_url}"
-    body_with_cta = body
-    audience_str = ", ".join(audience)
-
-    # extract the relevant part of the spec for the agent to "discover"
-    send_campaign_spec = raw_spec.get("paths", {}).get("/api/v1/send_campaign", {})
-    spec_json = json.dumps(send_campaign_spec, indent=2)
-
-    # build a prompt that enforces documentation-based discovery
-    prompt = f"""
-You are a technical execution agent for CampaignX. You must fulfill a campaign request by 
-discovering the correct payload structure from the API documentation provided below.
-
-### API Documentation (Dynamic Discovery):
-{spec_json}
-
-### Campaign Context:
-- Subject: {content.get('subject', '')}
-- Body: {body_with_cta}
-- Send Time: {send_time}
-- Target Audience Segments: {audience_str}
-
-### Instructions:
-1. Analyze the 'requestBody' and 'schema' in the documentation above.
-2. Formulate a JSON object that satisfies ALL 'required' fields and data types.
-3. The 'list_customer_ids' should be a list of strings containing exactly those customers 
-   fitting the audience segments provided.
-
-**Important:** Respond with _strictly valid JSON_ and nothing else. Do not include 
-comments, markdown blocks, or explanations.
-"""
-
-    # ask Ollama for the payload
-    raw = ollama_chat(
-        [{"role": "user", "content": prompt}],
-        model="qwen2.5-coder:latest",
-        temperature=0.0,
-        max_tokens=2048,
-    )
-
-    # extract JSON from agent output
-    cleaned = _extract_json_object(raw)
-    if not cleaned:
-        raise RuntimeError(f"Agent failed to produce any JSON object. Raw output: {raw}")
-
-    try:
-        payload = json.loads(cleaned)
-    except Exception as e:
-        raise RuntimeError(f"Agent produced invalid JSON payload: {raw}") from e
-
-    # validate payload structure
-    if not all(k in payload for k in ("subject", "body", "list_customer_ids", "send_time")):
-        raise ValueError(f"Payload missing required keys: {payload}")
-    if not isinstance(payload["list_customer_ids"], list):
-        raise ValueError("list_customer_ids must be a list")
-
-    # finally send using our safe helper
-    # ensure the payload's send_time is also normalized
-    cid, logs = _send_campaign_direct(
+    print("[DEBUG][PLAN] preparing campaign send proposal")
+    proposal = plan_api_call_from_spec(
         raw_spec=raw_spec,
         api_key=api_key,
-        subject=payload["subject"],
-        body=payload["body"],
-        list_customer_ids=payload["list_customer_ids"],
-        send_time=normalize_send_time(payload["send_time"]),
+        action="send_campaign",
+        campaign_context=campaign_context,
     )
-    return {
+    print("[DEBUG][PLAN] campaign send proposal ready")
+    proposal_payload = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
+    proposal_payload["subject"] = content.get("subject", "")
+    proposal_payload["body"] = body_with_cta
+    proposal_payload["list_customer_ids"] = planning_customer_ids
+    proposal_payload["send_time"] = send_time
+    proposal["payload"] = proposal_payload
+
+    validated = validate_api_call_proposal(proposal, raw_spec=raw_spec, action="send_campaign")
+    preview = {
         "success": True,
-        "campaign_id": cid,
-        "logs": logs
+        "approved": bool(approved),
+        "requires_approval": True,
+        "preview_ready": True,
+        "subject": validated["payload"].get("subject", ""),
+        "body": validated["payload"].get("body", ""),
+        "customer_ids": validated["payload"].get("list_customer_ids", []),
+        "send_time": validated["payload"].get("send_time", ""),
+        "discovered_operation": {
+            "operation_id": validated.get("operation_id"),
+            "method": validated.get("method"),
+            "path": validated.get("path"),
+            "summary": validated.get("summary"),
+        },
+        "payload": validated["payload"],
+        "logs": validated.get("logs", ""),
     }
+
+    if approved is not True:
+        preview["message"] = "Approval required before execution."
+        return preview
+
+    executed = execute_validated_api_call(
+        validated_proposal=validated,
+        raw_spec=raw_spec,
+        api_key=api_key,
+        approved=True,
+    )
+    preview.update(
+        {
+            "approved": True,
+            "preview_ready": False,
+            "campaign_id": executed.get("campaign_id"),
+            "response": executed.get("response"),
+            "logs": "\n".join(part for part in [validated.get("logs", ""), json.dumps(executed.get("response", {}), ensure_ascii=False)] if part).strip(),
+        }
+    )
+    return preview

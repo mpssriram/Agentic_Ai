@@ -2,12 +2,14 @@ import os
 import json
 import time
 import random
+import re
 from typing import List, Dict, Any
 from openai import OpenAI
 
 # Ollama OpenAI-compatible endpoint
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:latest")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_DEBUG = os.getenv("CAMPAIGNX_DEBUG_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
 
 client = OpenAI(
     base_url=OLLAMA_BASE_URL,
@@ -34,6 +36,8 @@ def ollama_chat(
     while True:
         attempt += 1
         try:
+            if OLLAMA_DEBUG:
+                print(f"[DEBUG][OLLAMA] model={model} temperature={temperature} max_tokens={max_tokens} attempt={attempt}")
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -66,6 +70,44 @@ def _clean_json_string(s: str) -> str:
     # What strict=False doesn't handle are things like unescaped double quotes inside strings.
     return s.strip()
 
+
+def _strip_code_fences(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    return None
+
 def ollama_generate_json(
     prompt: str,
     *,
@@ -77,30 +119,24 @@ def ollama_generate_json(
     Helper that expects a JSON response and parses it with extreme robustness.
     """
     messages = [{"role": "user", "content": prompt}]
+    if OLLAMA_DEBUG:
+        print(f"[DEBUG][OLLAMA] generate_json model={model} temperature={temperature} max_tokens={max_tokens}")
     raw = ollama_chat(messages, model=model, temperature=temperature, max_tokens=max_tokens)
-    
-    # Pre-clean: Remove markdown code blocks if present
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        # Find first { and last }
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1:
-            cleaned = cleaned[start:end+1]
+    cleaned = _strip_code_fences(_clean_json_string(raw))
 
     try:
-        # strict=False allows literal control characters (like real newlines) in strings
         return json.loads(cleaned, strict=False)
     except json.JSONDecodeError as e:
-        # Fallback: aggressive search for the first { ... } block
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            inner = cleaned[start:end+1]
+        inner = _extract_first_json_object(cleaned)
+        if inner:
             try:
                 return json.loads(inner, strict=False)
-            except json.JSONDecodeError:
-                # Last resort: try to escape problematic characters manually if it's a simple string error
-                # This is risky, but let's try to just return a helpful error if it fails
-                raise ValueError(f"Ollama returned invalid JSON: {e}\nRaw snippet: {inner[:200]}...")
-        raise ValueError(f"No JSON object found in Ollama response: {raw[:200]}...")
+            except json.JSONDecodeError as inner_error:
+                raise ValueError(
+                    f"Ollama returned invalid JSON: {inner_error}. "
+                    f"Raw prefix={repr(raw[:200])} length={len(raw)}"
+                ) from inner_error
+        raise ValueError(
+            f"No JSON object found in Ollama response: {e}. "
+            f"Raw prefix={repr(raw[:200])} length={len(raw)}"
+        ) from e

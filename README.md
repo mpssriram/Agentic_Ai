@@ -43,7 +43,7 @@ Agentic_Ai/
 1. Copy `.env.example` to `.env` and fill in your keys:
    ```
    CAMPAIGNX_API_KEY=your_key_here
-   OLLAMA_MODEL=qwen2.5-coder:latest
+   OLLAMA_MODEL=llama3.1:8b
    ```
 
 2. Install dependencies:
@@ -57,7 +57,7 @@ Agentic_Ai/
    ```
 
 ## Tech Stack
-- **LLM:** Ollama (local) with `qwen2.5-coder:latest`
+- **LLM:** Ollama (local) with `llama3.1:8b`
 - **Agentic Framework:** LangChain
 - **UI:** Streamlit + custom CSS
 - **APIs:** SuperBFSI CampaignX API (OpenAPI spec-based dynamic discovery)

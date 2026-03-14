@@ -14,6 +14,12 @@ from langchain_community.agent_toolkits.openapi.base import create_openapi_agent
 from langchain_community.tools.json.tool import JsonSpec
 from pydantic import BaseModel, Field
 from utils.ollama_client import ollama_chat
+from agents.executor import (
+    HACKATHON_POLICY,
+    execute_validated_api_call,
+    plan_api_call_from_spec,
+    validate_api_call_proposal,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 _SPEC_PATH = str(_REPO_ROOT / "data" / "superbfsi_api_spec.yaml")
@@ -23,7 +29,7 @@ from langchain_core.outputs import ChatResult, ChatGeneration
 from typing import Any, List, Optional
 
 class OllamaLangChainWrapper(BaseChatModel):
-    model: str = "qwen2.5-coder:latest"
+    model: str = "llama3.1:8b"
     temperature: float = 0.0
     max_tokens: int = 2048
 
@@ -127,24 +133,60 @@ def _spec_base_url(raw_spec: dict) -> str:
     return "https://campaignx.inxiteout.ai"
 
 
+OPTIMIZER_POLICY = {
+    "allowed_url": HACKATHON_POLICY["allowed_url"],
+    "click_weight": 0.7,
+    "open_weight": 0.3,
+    "open_rate_target": 8.0,
+    "click_rate_target": 2.0,
+    "max_retries": 3,
+    "required_fact_phrases": [
+        "1 percentage point higher returns",
+        "an additional 0.25 percentage point higher returns",
+        "Zero monthly fees",
+    ],
+}
+
+REPORT_POLL_TIMEOUT_SECONDS = 120
+REPORT_POLL_INTERVAL_SECONDS = 5
+
+
 
 
 class OptimizedVariant(BaseModel):
     segment_name: str = Field(description="Name of the micro-segment")
     reasoning: str = Field(description="Why this micro-segment was identified")
     subject: str = Field(description="Optimized subject line for this segment")
-    body: str = Field(description="Optimized body content for this segment with emojis and Markdown font variations")
+    body: str = Field(description="Optimized body content for this segment")
     send_time: str = Field(description="Optimized send time in DD:MM:YY HH:MM:SS format")
 
 class OptimizationResult(BaseModel):
-    overall_sentiment: str = Field(description="Analysis of the original campaign performance")
+    overall_sentiment: str = Field(description="Short metric-based summary referencing open rate, click rate, and performance score")
     micro_segments: list[OptimizedVariant] = Field(description="List of optimized variants for identified micro-segments")
 
 
-def _open_first_score(metrics: dict) -> float:
+def _campaign_score(metrics: dict) -> float:
     open_rate = metrics.get("open_rate", 0.0)
     click_rate = metrics.get("click_rate", 0.0)
-    return round((open_rate * 0.6) + (click_rate * 0.4), 2)
+    return round(
+        (click_rate * OPTIMIZER_POLICY["click_weight"]) + (open_rate * OPTIMIZER_POLICY["open_weight"]),
+        2,
+    )
+
+
+def _debug_report_summary(records: list[dict]) -> dict:
+    total = len(records)
+    open_count = sum(1 for rec in records if rec.get("EO") == "Y")
+    click_count = sum(1 for rec in records if rec.get("EC") == "Y")
+    return {
+        "total_recipients": total,
+        "open_count": open_count,
+        "click_count": click_count,
+        "open_rate": round(open_count * 100 / total, 2) if total else 0.0,
+        "click_rate": round(click_count * 100 / total, 2) if total else 0.0,
+        "eo_y_count": open_count,
+        "ec_y_count": click_count,
+    }
 
 
 def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
@@ -159,122 +201,254 @@ def _fetch_metrics_from_report(campaign_id: str) -> tuple[dict, str]:
     with open(spec_path, "r") as f:
         raw_spec = yaml.safe_load(f)
 
-    headers = {"Content-Type": "application/json", "X-API-Key": api_key}
-    
-    # Direct fetch for reliability; agentic exploration was failing on parsing
-    url = f"{_spec_base_url(raw_spec)}/api/v1/get_report?campaign_id={campaign_id}"
-    print(f"[INFO] Fetching report from {url}...")
-    
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        print(f"RAW API RESPONSE: {resp.json()}")
-        payload = resp.json()
+        proposal = plan_api_call_from_spec(
+            raw_spec=raw_spec,
+            api_key=api_key,
+            action="get_report",
+            campaign_context={
+                "action": "fetch_campaign_report",
+                "campaign_id": str(campaign_id),
+                "allowed_operations": list(HACKATHON_POLICY["allowed_report_operations"].keys()),
+            },
+        )
+        proposal["payload"] = {"campaign_id": str(campaign_id)}
+        validated = validate_api_call_proposal(proposal, raw_spec=raw_spec, action="get_report")
+        executed = execute_validated_api_call(
+            validated_proposal=validated,
+            raw_spec=raw_spec,
+            api_key=api_key,
+            approved=True,
+        )
+        payload = executed.get("response", {})
+        print("[DEBUG][REPORT] Raw JSON response:")
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         records = payload.get("data", []) or []
-        total = len(records)
+        summary = _debug_report_summary(records)
+        print("[DEBUG][REPORT] Parsed summary:")
+        print(
+            f"  total_recipients={summary['total_recipients']} | "
+            f"open_count={summary['open_count']} | "
+            f"click_count={summary['click_count']} | "
+            f"open_rate={summary['open_rate']}% | "
+            f"click_rate={summary['click_rate']}% | "
+            f"EO=='Y' count={summary['eo_y_count']} | "
+            f"EC=='Y' count={summary['ec_y_count']}"
+        )
+
+        total = summary["total_recipients"]
         if total <= 0:
-            return {"open_rate": 0.0, "click_rate": 0.0}, "Report fetched directly (empty)."
+            return {
+                "total_rows": 0,
+                "eo_y_count": 0,
+                "ec_y_count": 0,
+                "open_rate": 0.0,
+                "click_rate": 0.0,
+                "recipient_count": 0,
+            }, "Report fetched directly (empty)."
 
-        open_count = sum(1 for rec in records if rec.get("EO") == "Y")
-        click_count = sum(1 for rec in records if rec.get("EC") == "Y")
         metrics = {
-            "open_rate": round(open_count*100/total, 2), 
-            "click_rate": round(click_count*100/total, 2)
+            "total_rows": total,
+            "eo_y_count": summary["eo_y_count"],
+            "ec_y_count": summary["ec_y_count"],
+            "open_rate": summary["open_rate"],
+            "click_rate": summary["click_rate"],
+            "recipient_count": total,
         }
-        return metrics, f"Report fetched directly. Found {total} records."
+        return metrics, (
+            f"Report fetched via spec-discovered {validated['method']} {validated['path']}. "
+            f"Found {total} records."
+        )
     except Exception as e:
-        raise RuntimeError(f"Direct analytics fetch failed: {e}")
+        raise RuntimeError(f"Spec-driven analytics fetch failed: {e}")
 
 
-def _aggregate_metrics_from_reports(campaign_ids: list[str]) -> tuple[dict, str]:
+def _aggregate_metrics_from_reports(campaign_ids: list[str], *, poll: bool = False) -> tuple[dict, str]:
     valid_ids = [str(cid).strip() for cid in campaign_ids if str(cid).strip()]
     if not valid_ids:
-        return {"open_rate": 0.0, "click_rate": 0.0}, "No campaign IDs provided."
+        return {
+            "total_rows": 0,
+            "eo_y_count": 0,
+            "ec_y_count": 0,
+            "open_rate": 0.0,
+            "click_rate": 0.0,
+            "recipient_count": 0,
+        }, "No campaign IDs provided."
 
-    open_weighted_total = 0.0
-    click_weighted_total = 0.0
-    recipient_total = 0
+    total_rows = 0
+    eo_y_count = 0
+    ec_y_count = 0
     logs: list[str] = []
 
+    fetch_fn = _poll_metrics_from_report if poll else _fetch_metrics_from_report
+
     for cid in valid_ids:
-        metrics, log_line = _fetch_metrics_from_report(cid)
+        metrics, log_line = fetch_fn(cid)
         logs.append(f"{cid}: {log_line}")
+        total_rows += int(metrics.get("total_rows", metrics.get("recipient_count", 0)) or 0)
+        eo_y_count += int(metrics.get("eo_y_count", 0) or 0)
+        ec_y_count += int(metrics.get("ec_y_count", 0) or 0)
 
-        recipients = 0
-        m = re.search(r"Found\s+(\d+)\s+records", log_line)
-        if m:
-            recipients = int(m.group(1))
-
-        if recipients <= 0:
-            continue
-
-        recipient_total += recipients
-        open_weighted_total += metrics.get("open_rate", 0.0) * recipients
-        click_weighted_total += metrics.get("click_rate", 0.0) * recipients
-
-    if recipient_total <= 0:
-        return {"open_rate": 0.0, "click_rate": 0.0}, "\n".join(logs) if logs else "Reports fetched but no recipient records found."
+    if total_rows <= 0:
+        return {
+            "total_rows": 0,
+            "eo_y_count": 0,
+            "ec_y_count": 0,
+            "open_rate": 0.0,
+            "click_rate": 0.0,
+            "recipient_count": 0,
+        }, "\n".join(logs) if logs else "Reports fetched but no recipient records found."
 
     aggregate = {
-        "open_rate": round(open_weighted_total / recipient_total, 2),
-        "click_rate": round(click_weighted_total / recipient_total, 2),
-        "recipient_count": recipient_total,
+        "total_rows": total_rows,
+        "eo_y_count": eo_y_count,
+        "ec_y_count": ec_y_count,
+        "open_rate": round(eo_y_count * 100 / total_rows, 2),
+        "click_rate": round(ec_y_count * 100 / total_rows, 2),
+        "recipient_count": total_rows,
         "campaign_count": len(valid_ids),
     }
     return aggregate, "\n".join(logs)
 
 
+def _poll_metrics_from_report(
+    campaign_id: str,
+    *,
+    timeout_seconds: int = REPORT_POLL_TIMEOUT_SECONDS,
+    interval_seconds: int = REPORT_POLL_INTERVAL_SECONDS,
+) -> tuple[dict, str]:
+    logs: list[str] = []
+    latest_metrics = {
+        "total_rows": 0,
+        "eo_y_count": 0,
+        "ec_y_count": 0,
+        "open_rate": 0.0,
+        "click_rate": 0.0,
+        "recipient_count": 0,
+    }
+    last_error: Exception | None = None
+    deadline = time.time() + timeout_seconds
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            metrics, log_line = _fetch_metrics_from_report(campaign_id)
+            latest_metrics = metrics
+            total_rows = int(metrics.get("total_rows", metrics.get("recipient_count", 0)) or 0)
+            eo_count = int(metrics.get("eo_y_count", 0) or 0)
+            ec_count = int(metrics.get("ec_y_count", 0) or 0)
+            remaining = max(0, int(deadline - time.time()))
+            summary = f"poll_attempt={attempt} total_rows={total_rows} EO_count={eo_count} EC_count={ec_count} remaining_seconds={remaining}"
+            print(f"[DEBUG][REPORT] {summary}")
+            logs.append(f"{summary} | {log_line}")
+            if total_rows > 0:
+                return latest_metrics, "\n".join(logs)
+        except Exception as e:
+            last_error = e
+            remaining = max(0, int(deadline - time.time()))
+            summary = f"poll_attempt={attempt} error={e} remaining_seconds={remaining}"
+            print(f"[DEBUG][REPORT] {summary}")
+            logs.append(summary)
+
+        remaining_seconds = deadline - time.time()
+        if remaining_seconds <= 0:
+            break
+        time.sleep(min(interval_seconds, max(0, remaining_seconds)))
+
+    timeout_message = "report not ready yet; timed out after 2 minutes"
+    logs.append(timeout_message)
+    if last_error and latest_metrics.get("recipient_count", 0) <= 0:
+        logs.append(f"last_error={last_error}")
+    return latest_metrics, "\n".join(logs)
+
+
 def optimize_campaign(campaign_id: str | list[str], current_content: dict) -> dict:
     if isinstance(campaign_id, list):
-        metrics, report_logs = _aggregate_metrics_from_reports(campaign_id)
+        metrics, report_logs = _aggregate_metrics_from_reports(campaign_id, poll=True)
         campaign_scope = ", ".join(campaign_id)
     else:
-        metrics, report_logs = _fetch_metrics_from_report(campaign_id)
+        metrics, report_logs = _poll_metrics_from_report(campaign_id)
         campaign_scope = campaign_id
     click_rate = metrics.get("click_rate", 0.0)
     open_rate = metrics.get("open_rate", 0.0)
-    performance_score = _open_first_score(metrics)
+    recipient_count = metrics.get("recipient_count", 0)
+    performance_score = _campaign_score(metrics)
+
+    if recipient_count <= 0:
+        return {
+            "performance_score": performance_score,
+            "metrics": metrics,
+            "optimized_content": {
+                "overall_sentiment": "No live engagement report records are available yet, so open rate and CTR are still pending. Wait for report data before drawing conclusions about subject-line or email-body performance.",
+                "micro_segments": [],
+            },
+            "logs": report_logs,
+        }
 
     from utils.ollama_client import ollama_generate_json
     
-    prompt = f"""You are a performance optimization expert.
+    prompt = f"""You are a performance optimization expert for CampaignX.
 
 Current Campaign Performance:
 - Open Rate: {open_rate}%
 - Click Rate: {click_rate}%
-- Open-first Score (60% Open, 40% Click): {performance_score:.2f}
+- Campaign Score (70% Click, 30% Open): {performance_score:.2f}
 - Campaign Scope: {campaign_scope}
 
 Optimization Priorities (IMPORTANT):
-- Diagnose opens first, then clicks.
-- Prioritize improvements that increase open rate via subject-line specificity, relevance, and send-time choice.
-- Then improve click rate through clearer body copy and CTA framing.
+- Optimize primarily for click-through rate because the final evaluation weights clicks more heavily.
+- Still protect open rate through stronger relevance, clearer subjects, and better send-time choice.
+- Improve click intent through sharper value framing, clearer motivation, and a stronger action line.
 
 Original Content:
 Subject: {current_content.get('subject', '')}
 Body: {current_content.get('body', '')}
 
 Task:
-1. Analyze the performance with respect to EC and EO outcomes (EC is more important than EO).
-2. Identify 2-3 micro-segments that are most likely to increase opens and then clicks.
+1. Analyze the performance with respect to EO and EC outcomes, with click-through rate treated as the primary optimization signal.
+2. Identify up to 3 micro-segments only when they are meaningfully supported by the campaign context and performance signals.
 3. For each micro-segment, generate an optimized version of the email (subject and body).
-   The subject should be explicitly designed to increase opens first.
+   The subject should stay strong for opens, but the body and action line should be designed to improve clicks.
 4. Recommend an optimized 'send_time' for each segment (e.g., morning for professionals, evening for students). 
    Format: DD:MM:YY HH:MM:SS. Use year 2026.
+5. Write `overall_sentiment` as a short, specific summary that explicitly references:
+   - open rate
+   - click rate
+   - performance score
+   If click rate is lagging, say clearly that clicks are the primary optimization signal.
+
+Reasoning guidance:
+Look at the previous campaign results. You achieved an open rate of {open_rate}% and a click rate of {click_rate}%.
+
+Use these results to infer whether formatting or delivery may have reduced click performance.
+If click rate is very low or 0.0%, consider possible causes such as:
+- the CTA URL being wrapped in HTML tags that the grading/reporting system may not track reliably
+- overly decorative formatting or excessive emoji use reducing trust or deliverability
+- weak CTA clarity or low action intent in the copy
+
+Based on the metrics, decide whether the next variant should:
+- use a naked URL instead of HTML
+- reduce or remove emojis
+- simplify formatting
+- strengthen CTA clarity and benefit-led opening lines
+
+Do not output chain-of-thought or extra commentary outside the required structured response. Apply the reasoning internally and return only the final structured variant.
 
 STRICT FORMATTING RULES FOR VARIANTS:
 - NO PLACEHOLDERS: NEVER output [Link], [Recipient's Name], etc.
 - CRITICAL USP RULES (NO MATH, EXACT MATCH ONLY): The body must explicitly mention these three exact phrases Word-for-Word:
-  1) "1 percentage point higher returns"
-  2) "an additional 0.25 percentage point higher returns"
-  3) "Zero monthly fees"
+  1) "{OPTIMIZER_POLICY['required_fact_phrases'][0]}"
+  2) "{OPTIMIZER_POLICY['required_fact_phrases'][1]}"
+  3) "{OPTIMIZER_POLICY['required_fact_phrases'][2]}"
   DO NOT simplify or combine to "1.25". DO NOT alter the wording.
-- Keep body text under 4 sentences. Do NOT use markdown.
-- URL Injection: Do NOT include URLs in the JSON output.
+- Keep the format compatible with the current sending flow.
+- Use formatting, emoji, and CTA style only when the metrics suggest they will help.
+- If a URL is included in a variant body, use only the approved CampaignX URL: {OPTIMIZER_POLICY['allowed_url']}
 
 Return ONLY valid JSON exactly matching this structure, with nothing else:
 {{
-  "overall_sentiment": "Analysis of the original campaign performance",
+  "overall_sentiment": "Open rate is X%, click rate is Y%, and performance score is Z. Clicks are the primary optimization signal, so the next iteration should focus on improving CTR while protecting opens.",
   "micro_segments": [
     {{
       "segment_name": "Name of the micro-segment",
@@ -302,9 +476,9 @@ Return ONLY valid JSON exactly matching this structure, with nothing else:
 
 
 # ── Targets ───────────────────────────────────────────────────────────────────
-OPEN_RATE_TARGET  = 30.0   # %
-CLICK_RATE_TARGET = 70.0   # %
-MAX_RETRIES       = 3
+OPEN_RATE_TARGET = OPTIMIZER_POLICY["open_rate_target"]
+CLICK_RATE_TARGET = OPTIMIZER_POLICY["click_rate_target"]
+MAX_RETRIES = OPTIMIZER_POLICY["max_retries"]
 
 
 def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
@@ -312,7 +486,7 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
     Ask the LLM (acting as Creator Agent) to rewrite the email based on
     the performance critique. Returns a new content dict {subject, body, url}.
     """
-    prompt = f"""Act as an elite, direct-response copywriter.
+    prompt = f"""Act as an elite BFSI marketing copywriter.
     
     A previous campaign email had the following performance:
     - Open Rate : {metrics.get('open_rate', 0)}%  (target ≥ {OPEN_RATE_TARGET}%)
@@ -325,36 +499,48 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
     {current_content.get('body', '')}
 
     Task: Rewrite the email as an expert digital marketer for SuperBFSI’s XDeposit. 
-    Use emojis only when they make the subject or body feel more clickable.
+    Improve click-through rate first, while keeping opens healthy.
+    Make the subject more attractive and professional.
+    Make the opening line stronger and more customer-facing.
+    Make the body feel worth clicking, not just worth reading.
+    Keep the body concise and compatible with the current sending flow.
+    Decide adaptively whether emoji, CTA URL style, or lighter formatting will help based on the observed metrics.
     
     CRITICAL USP RULES (NO MATH, NO CREATIVITY, EXACT MATCH ONLY):
     The body must explicitly mention these three exact phrases Word-for-Word:
-    - "1 percentage point higher returns"
-    - "an additional 0.25 percentage point higher returns" 
-    - "Zero monthly fees"
+    - "{OPTIMIZER_POLICY['required_fact_phrases'][0]}"
+    - "{OPTIMIZER_POLICY['required_fact_phrases'][1]}" 
+    - "{OPTIMIZER_POLICY['required_fact_phrases'][2]}"
     DO NOT simplify to 1.25. DO NOT alter the wording.
     
     STRICT FORMATTING RULES:
     - NO PLACEHOLDERS: NEVER output [Link], [Recipient's Name], [Insert Name], or [URL].
     - NO PREFIXES: Do not output 'Subject:' or 'Body:'. 
-    - Keep the body under 4 sentences. Do not use Markdown formatting.
+    - Keep formatting compatible with the current sending flow and do not assume one fixed presentation style.
     
-    Return ONLY valid JSON with keys: "subject", "body".
-    Note: Do not include the URL in the body; it will be added automatically limit it to exact JSON keys requested.
+    Focus areas when click rate is low:
+    - improve CTA wording
+    - improve CTA placement
+    - improve action clarity
+    - improve body scannability
+    - consider whether simpler formatting, fewer emojis, or a different CTA presentation would improve trust and click tracking
+
+    Return ONLY valid JSON with keys: "subject", "body", "cta_text", "cta_placement".
+    Use cta_placement as one of: "start", "middle", "end".
     """
     from utils.ollama_client import ollama_generate_json
     try:
         rewritten = ollama_generate_json(prompt, temperature=0.7, max_tokens=1024)
         
-        # Python-side URL Injection (CRITICAL)
         raw_url = "https://superbfsi.com/xdeposit/explore/"
         body_text = rewritten.get("body", current_content["body"]).strip()
-        body_with_url = f"{body_text}\n\n{raw_url}"
 
         return {
             "subject": rewritten.get("subject", current_content["subject"]),
-            "body":    body_with_url,
+            "body":    body_text,
             "url":     raw_url,
+            "cta_text": rewritten.get("cta_text", current_content.get("cta_text", "Explore XDeposit")),
+            "cta_placement": rewritten.get("cta_placement", current_content.get("cta_placement", "end")),
         }
     except Exception as e:
         print(f"[WARN] _rewrite_email failed: {e}")
@@ -416,6 +602,7 @@ def run_optimization_loop(
                 audience,
                 customer_ids=customer_ids,
                 send_time=send_time,
+                approved=True,
             )
         except Exception as e:
             _emit(f"❌ Send failed on attempt {attempt}: {e}")
@@ -444,18 +631,17 @@ def run_optimization_loop(
 
         # ── Step 2: fetch report ───────────────────────────────────────────
         _emit(f"📊 Fetching performance report (campaign_id={campaign_id})...")
-        time.sleep(2)  # Give mock API/simulated environment time to register clicks
         try:
-            metrics, _ = _fetch_metrics_from_report(campaign_id)
+            metrics, _ = _poll_metrics_from_report(campaign_id)
         except Exception as e:
             _emit(f"⚠️  Could not fetch report: {e}. Using zeroed metrics.")
-            metrics = {"open_rate": 0.0, "click_rate": 0.0}
+            metrics = {"open_rate": 0.0, "click_rate": 0.0, "total_rows": 0, "eo_y_count": 0, "ec_y_count": 0}
 
         open_rate  = metrics.get("open_rate",  0.0)
         click_rate = metrics.get("click_rate", 0.0)
         _emit(f"📈 Attempt {attempt} metrics — Open: {open_rate}%  Click: {click_rate}%")
 
-        score = _open_first_score(metrics)
+        score = _campaign_score(metrics)
         attempt_record = {
             "attempt":     attempt,
             "campaign_id": campaign_id,
