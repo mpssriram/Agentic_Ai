@@ -1,19 +1,10 @@
 import os
 import json
-import re
 import yaml
 import pathlib
-import requests
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-from langchain_community.agent_toolkits.openapi.toolkit import OpenAPIToolkit
-from langchain_community.utilities.requests import RequestsWrapper
-from langchain_community.agent_toolkits.openapi.base import create_openapi_agent
-from langchain_community.tools.json.tool import JsonSpec
 from pydantic import BaseModel, Field
-from utils.ollama_client import ollama_chat
 from agents.executor import (
     HACKATHON_POLICY,
     execute_validated_api_call,
@@ -23,116 +14,6 @@ from agents.executor import (
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 _SPEC_PATH = str(_REPO_ROOT / "data" / "superbfsi_api_spec.yaml")
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
-from langchain_core.outputs import ChatResult, ChatGeneration
-from typing import Any, List, Optional
-
-class OllamaLangChainWrapper(BaseChatModel):
-    model: str = "llama3.1:8b"
-    temperature: float = 0.0
-    max_tokens: int = 2048
-
-    def _generate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None, run_manager: Optional[Any] = None, **kwargs: Any) -> ChatResult:
-        # standardizing stop sequence behavior for agentic reliability
-        if stop is None:
-            stop = []
-        # LangChain agents often rely on these specific tokens
-        if "Observation:" not in stop:
-            stop.append("Observation:")
-        
-        ollama_msgs = []
-        for m in messages:
-            if isinstance(m, HumanMessage):
-                ollama_msgs.append({"role": "user", "content": m.content})
-            elif isinstance(m, SystemMessage):
-                ollama_msgs.append({"role": "system", "content": m.content})
-            elif isinstance(m, AIMessage):
-                ollama_msgs.append({"role": "assistant", "content": m.content})
-            else:
-                ollama_msgs.append({"role": "user", "content": str(m.content)})
-        
-        text = ollama_chat(ollama_msgs, model=self.model, temperature=self.temperature, max_tokens=self.max_tokens, stop=stop)
-        
-        message = AIMessage(content=text)
-        generation = ChatGeneration(message=message)
-        return ChatResult(generations=[generation])
-
-    @property
-    def _llm_type(self) -> str:
-        return "ollama"
-
-
-try:
-    from langchain_core.callbacks.base import BaseCallbackHandler
-except Exception:
-    class BaseCallbackHandler:  # type: ignore
-        pass
-
-
-class _AgentLogCapture(BaseCallbackHandler):
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def on_tool_start(self, serialized=None, input_str=None, **kwargs) -> None:
-        if input_str is None:
-            input_str = kwargs.get("input_str") or kwargs.get("input") or kwargs.get("inputs")
-
-        name = None
-        if isinstance(serialized, dict):
-            name = serialized.get("name")
-        self.lines.append(f"TOOL START: {name or 'unknown'}")
-        if input_str is not None:
-            self.lines.append(f"INPUT: {input_str}")
-
-    def on_tool_end(self, output=None, **kwargs) -> None:
-        if output is not None:
-            self.lines.append(f"TOOL END: {output}")
-
-    def on_agent_finish(self, finish, **kwargs) -> None:
-        out = getattr(finish, "return_values", None)
-        if out is not None:
-            self.lines.append(f"AGENT FINISH: {out}")
-
-    def text(self) -> str:
-        return "\n".join(self.lines).strip()
-
-
-def _extract_json_object(text: str) -> str | None:
-    if not text:
-        return None
-    m = re.search(r"\{[\s\S]*\}", text)
-    return m.group(0) if m else None
-
-
-def _invoke_agent(agent, prompt: str, cb: _AgentLogCapture):
-    attempts = [
-        lambda: agent.invoke(prompt, config={"callbacks": [cb]}),
-        lambda: agent.invoke({"input": prompt}, config={"callbacks": [cb]}),
-        lambda: agent.invoke(prompt, callbacks=[cb]),
-        lambda: agent.invoke({"input": prompt}, callbacks=[cb]),
-        lambda: agent.invoke(prompt),
-        lambda: agent.invoke({"input": prompt}),
-    ]
-    last_error: Exception | None = None
-    for fn in attempts:
-        try:
-            return fn()
-        except Exception as e:
-            last_error = e
-            continue
-    raise last_error or RuntimeError("Agent invocation failed")
-
-
-def _spec_base_url(raw_spec: dict) -> str:
-    servers = raw_spec.get("servers") if isinstance(raw_spec, dict) else None
-    if isinstance(servers, list) and servers:
-        url = (servers[0] or {}).get("url")
-        if isinstance(url, str) and url.strip():
-            return url.strip().rstrip("/")
-    return "https://campaignx.inxiteout.ai"
-
-
 OPTIMIZER_POLICY = {
     "allowed_url": None,
     "click_weight": 0.7,

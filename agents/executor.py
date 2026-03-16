@@ -19,7 +19,7 @@ from utils.ollama_client import ollama_chat
 # Paths resolved relative to this file so they work from any cwd
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 _SPEC_PATH = str(_REPO_ROOT / "data" / "superbfsi_api_spec.yaml")
-_LOCAL_COHORT_PATH = str(_REPO_ROOT / "customer_cohort.json")
+_LOCAL_COHORT_PATH = str(_REPO_ROOT / "data" / "customer_cohort.json")
 
 # show raw HTTP traffic from LangChain/OpenAPI toolkit
 langchain.debug = True

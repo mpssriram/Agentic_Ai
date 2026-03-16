@@ -3,7 +3,7 @@ import json
 import time
 import random
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable
 from openai import OpenAI
 
 # Ollama OpenAI-compatible endpoint
@@ -15,6 +15,45 @@ client = OpenAI(
     base_url=OLLAMA_BASE_URL,
     api_key="ollama",  # placeholder; Ollama doesn't require a real key
 )
+
+
+def llm_retry_with_backoff(
+    max_attempts: int = 4,
+    base_delay: float = 12.0,
+    max_delay: float = 120.0,
+    jitter: bool = True,
+) -> Callable[[Callable[..., str]], Callable[..., str]]:
+    """Retry transient LLM provider rate-limit or quota errors with exponential backoff."""
+
+    def decorator(func: Callable[..., str]) -> Callable[..., str]:
+        def wrapper(*args, **kwargs) -> str:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    e_str = str(e).lower()
+                    is_retryable = (
+                        "429" in e_str
+                        or "resource exhausted" in e_str
+                        or "quota" in e_str
+                        or "rate limit" in e_str
+                        or "ratelimit" in e_str
+                        or "too many requests" in e_str
+                    )
+                    if is_retryable and attempt < max_attempts:
+                        delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                        if jitter:
+                            delay += random.uniform(0, 0.2 * delay)
+                        print(f"LLM rate-limit/quota error (attempt {attempt}/{max_attempts}); retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    raise
+
+        return wrapper
+
+    return decorator
 
 def ollama_chat(
     messages: List[Dict[str, str]],
@@ -32,34 +71,28 @@ def ollama_chat(
     Simple wrapper around Ollama's OpenAI-compatible /chat/completions endpoint
     with built-in retry/backoff for 429/quota errors.
     """
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            if OLLAMA_DEBUG:
-                print(f"[DEBUG][OLLAMA] model={model} temperature={temperature} max_tokens={max_tokens} attempt={attempt}")
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stop=stop,
-            )
-            content = resp.choices[0].message.content
-            if content is None:
-                raise ValueError("Ollama returned empty content")
-            return content.strip()
-        except Exception as e:
-            e_str = str(e).lower()
-            if ("429" in e_str or "resource exhausted" in e_str or "quota" in e_str or "rate" in e_str) and attempt < max_attempts:
-                delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-                if jitter:
-                    delay += random.uniform(0, 0.2 * delay)
-                print(f"Ollama rate/quota error (attempt {attempt}/{max_attempts}); retrying in {delay:.1f}s...")
-                time.sleep(delay)
-                continue
-            else:
-                raise
+    @llm_retry_with_backoff(
+        max_attempts=max_attempts,
+        base_delay=base_delay,
+        max_delay=max_delay,
+        jitter=jitter,
+    )
+    def _call_ollama() -> str:
+        if OLLAMA_DEBUG:
+            print(f"[DEBUG][OLLAMA] model={model} temperature={temperature} max_tokens={max_tokens}")
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop=stop,
+        )
+        content = resp.choices[0].message.content
+        if content is None:
+            raise ValueError("Ollama returned empty content")
+        return content.strip()
+
+    return _call_ollama()
 
 def _clean_json_string(s: str) -> str:
     """

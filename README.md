@@ -125,26 +125,21 @@ Agentic_Ai/
 |-- agents/
 |   |-- creator.py
 |   |-- executor.py
-|   |-- llm_utils.py
 |   |-- optimizer.py
 |   `-- planner.py
 |-- assets/
 |   `-- style.css
-|-- config/
-|   `-- __init__.py
 |-- data/
+|   |-- customer_cohort.json
 |   `-- superbfsi_api_spec.yaml
 |-- tests/
 |   `-- test_ollama.py
 |-- utils/
 |   |-- __init__.py
-|   `-- ollama_client.py
+|   |-- ollama_client.py
+|   |-- scorer.py
+|   `-- validator.py
 |-- app.py
-|-- email_copy_agent.py
-|-- prompt_templates.py
-|-- scorer.py
-|-- validator.py
-|-- sample_runner.py
 |-- requirements.txt
 `-- README.md
 ```
@@ -185,14 +180,21 @@ pip install -r requirements.txt
 Copy `.env.example` to `.env` and update the values:
 
 ```env
-OLLAMA_MODEL=qwen2.5-coder:latest
+OLLAMA_MODEL=llama3.1:8b
 CAMPAIGNX_API_KEY=your_campaignx_api_key_here
+CAMPAIGNX_DEBUG_LLM=false
+CAMPAIGNX_CTA_MODE=raw_url
 ```
 
 Required variables:
 
 - `OLLAMA_MODEL`: local Ollama model name used by the agents
 - `CAMPAIGNX_API_KEY`: API key for customer cohort fetch, campaign sending, and reporting
+
+Optional variables:
+
+- `CAMPAIGNX_DEBUG_LLM`: enables verbose Ollama client logging
+- `CAMPAIGNX_CTA_MODE`: controls CTA rendering in email bodies (`raw_url`, `labeled_plain`, or `html_anchor`)
 
 ### 5. Start Ollama
 
@@ -201,7 +203,7 @@ Make sure Ollama is installed and the selected model is available locally.
 Example:
 
 ```bash
-ollama pull qwen2.5-coder:latest
+ollama pull llama3.1:8b
 ollama serve
 ```
 
@@ -260,10 +262,8 @@ The project follows the challenge evaluation preference by prioritizing click-th
 
 Supporting modules include:
 
-- `validator.py` for subject/body validation and payload checks
-- `scorer.py` for ranking and reasoning across generated variants
-- `prompt_templates.py` for reusable prompt fragments
-- `email_copy_agent.py` for copy generation and validation orchestration
+- `utils/validator.py` for subject/body validation and payload checks
+- `utils/scorer.py` for ranking and reasoning across generated variants
 
 These utilities help the generated content stay closer to the problem constraints and make the output more demo-ready.
 
@@ -278,10 +278,10 @@ py -3 -m compileall agents app.py utils
 And:
 
 ```bash
-pytest
+py -3 -m unittest tests.test_ollama tests.test_content_helpers
 ```
 
-If `pytest` is not installed in your environment, install it first or run the included lightweight checks manually.
+This test suite uses the Python standard library `unittest`, so no extra test dependency is required.
 
 ## Known Limitations
 

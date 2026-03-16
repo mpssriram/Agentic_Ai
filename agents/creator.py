@@ -2,6 +2,9 @@ import json
 import re
 from typing import Any
 
+from utils.scorer import rank_variants
+from utils.validator import validate_body, validate_subject
+
 try:
     from utils.ollama_client import ollama_generate_json
 except ImportError:
@@ -409,6 +412,136 @@ def _build_generic_fallback_content(
     }
 
 
+def _infer_optimization_target(plan: dict[str, Any], brief: str) -> str:
+    goal_text = " ".join(str(item) for item in plan.get("goals", []) if str(item).strip())
+    combined = f"{goal_text} {brief}".lower()
+    if "click" in combined:
+        return "click_rate"
+    if "open" in combined:
+        return "open_rate"
+    return "balanced"
+
+
+def _body_variant_id_sort_key(version_id: str) -> tuple[int, str]:
+    normalized = str(version_id or "").strip()
+    return (len(normalized), normalized)
+
+
+def _build_rankable_variant(
+    *,
+    version_id: str,
+    subject: str,
+    body: str,
+    cta_text: str,
+    cta_url: str,
+    cta_placement: str,
+    audience: list[str],
+    selection_reason: str,
+) -> dict[str, Any]:
+    return {
+        "variant_id": version_id,
+        "target_micro_segment": ", ".join(audience) or "approved audience",
+        "psychology_target": "click-oriented, trust-building BFSI messaging",
+        "subject": subject,
+        "body": body,
+        "cta_text": cta_text,
+        "cta_url": cta_url,
+        "formatting_plan": {"bold_phrases": [], "italic_phrases": [], "underline_phrases": []},
+        "emoji_plan": [],
+        "cta_used": bool(cta_url),
+        "cta_placement": "final" if cta_placement == "end" else (cta_placement or "final"),
+        "predicted_open_rate_reason": "Selected from generated subject candidates for clarity and relevance.",
+        "predicted_click_rate_reason": selection_reason or f"Uses CTA text '{cta_text}' with concise body copy.",
+        "risk_flags": [],
+        "approval_notes": "Auto-ranked inside the main creator flow.",
+    }
+
+
+def _select_best_variant(
+    *,
+    plan: dict[str, Any],
+    brief: str,
+    product_context: dict[str, Any],
+    best_subject_hint: str,
+    best_body_version_id: str,
+    selection_reason: str,
+    subject_candidates: list[str],
+    body_map: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+    if not subject_candidates or not body_map:
+        return None, [], []
+
+    allowed_urls = product_context.get("allowed_urls", [])
+    mandatory_cta = allowed_urls[0] if allowed_urls else ""
+    audience = [str(item).strip() for item in plan.get("target_audience", []) if str(item).strip()]
+    optimization_target = _infer_optimization_target(plan, brief)
+
+    unique_subjects: list[str] = []
+    for subject in ([best_subject_hint] if best_subject_hint else []) + subject_candidates:
+        normalized = _normalize_whitespace(subject)
+        if normalized and normalized not in unique_subjects:
+            unique_subjects.append(normalized)
+
+    ranked_inputs: list[dict[str, Any]] = []
+    validation_reports: list[dict[str, Any]] = []
+
+    preferred_order = [best_body_version_id] if best_body_version_id and best_body_version_id in body_map else []
+    remaining_ids = sorted(
+        [version_id for version_id in body_map.keys() if version_id not in preferred_order],
+        key=_body_variant_id_sort_key,
+    )
+    ordered_ids = preferred_order + remaining_ids
+
+    for version_id in ordered_ids:
+        body_info = body_map[version_id]
+        body = body_info["body"]
+        body_urls = _extract_urls(body)
+        matched_allowed_url = next((url for url in body_urls if url in allowed_urls), mandatory_cta)
+        body_report = validate_body(body, mandatory_cta=matched_allowed_url)
+        if not body_report["valid"]:
+            continue
+
+        for subject in unique_subjects:
+            subject_report = validate_subject(subject)
+            if not subject_report["valid"]:
+                continue
+
+            cta_url = (body_urls or [matched_allowed_url])[0] if (body or matched_allowed_url) else ""
+            variant = _build_rankable_variant(
+                version_id=f"{version_id}:{len(ranked_inputs) + 1}",
+                subject=subject,
+                body=body,
+                cta_text=body_info.get("cta_text") or GENERIC_FALLBACK_CTA_TEXT,
+                cta_url=cta_url,
+                cta_placement=body_info.get("cta_placement") or "end",
+                audience=audience,
+                selection_reason=selection_reason,
+            )
+            ranked_inputs.append(variant)
+            validation_reports.append(
+                {
+                    "valid": body_report["valid"] and subject_report["valid"],
+                    "errors": list(subject_report.get("errors", [])) + list(body_report.get("errors", [])),
+                    "warnings": list(subject_report.get("warnings", [])) + list(body_report.get("warnings", [])),
+                }
+            )
+
+    if not ranked_inputs:
+        return None, [], []
+
+    ranked_variants = rank_variants(
+        ranked_inputs,
+        optimization_target=optimization_target,
+        validation_reports=validation_reports,
+    )
+    best_variant = ranked_variants[0]
+    chosen_variant = next(
+        (variant for variant in ranked_inputs if variant["variant_id"] == best_variant["variant_id"]),
+        None,
+    )
+    return chosen_variant, ranked_variants, validation_reports
+
+
 def create_content(plan: dict[str, Any], brief: str) -> dict[str, Any]:
     product_context = _resolve_product_context(plan, brief)
     prompt = _build_creator_prompt(plan, brief, product_context)
@@ -439,16 +572,24 @@ def create_content(plan: dict[str, Any], brief: str) -> dict[str, Any]:
                 body_map[version_id] = {
                     "body": sanitized,
                     "cta_text": _normalize_whitespace((item or {}).get("cta_text") or GENERIC_FALLBACK_CTA_TEXT),
+                    "cta_placement": _normalize_whitespace((item or {}).get("cta_placement") or "end").lower() or "end",
                 }
 
         if not best_subject or not _is_valid_subject(best_subject):
             best_subject = subject_candidates[0] if subject_candidates else GENERIC_FALLBACK_SUBJECTS[0]
 
-        chosen_body = body_map.get(best_body_version_id)
-        if not chosen_body and body_map:
-            chosen_body = next(iter(body_map.values()))
+        chosen_variant, ranked_variants, validation_reports = _select_best_variant(
+            plan=plan,
+            brief=brief,
+            product_context=product_context,
+            best_subject_hint=best_subject,
+            best_body_version_id=best_body_version_id,
+            selection_reason=selection_reason,
+            subject_candidates=subject_candidates,
+            body_map=body_map,
+        )
 
-        if not chosen_body:
+        if not chosen_variant:
             fallback = _build_generic_fallback_content(brief, plan, product_context)
             return {
                 "subject": best_subject or fallback["subject"],
@@ -459,21 +600,35 @@ def create_content(plan: dict[str, Any], brief: str) -> dict[str, Any]:
                 "product_name": fallback.get("product_name", product_context.get("product_name", "")),
                 "approved_facts": fallback.get("approved_facts", product_context.get("approved_facts", [])),
                 "allowed_urls": fallback.get("allowed_urls", product_context.get("allowed_urls", [])),
+                "variant_scores": [],
+                "validation_reports": validation_reports,
             }
 
         allowed_urls = product_context.get("allowed_urls", [])
-        primary_url = _extract_urls(chosen_body["body"])
+        primary_url = _extract_urls(chosen_variant["body"])
         final_url = primary_url[0] if primary_url else (allowed_urls[0] if allowed_urls else "")
+        best_rank = ranked_variants[0] if ranked_variants else None
+        best_reasoning = []
+        if best_rank:
+            best_reasoning = (
+                best_rank.get("reasoning", {}).get("click", [])
+                + best_rank.get("reasoning", {}).get("compliance", [])
+            )
+        resolved_reason = selection_reason or "Selected for the strongest click-oriented structure."
+        if best_reasoning:
+            resolved_reason = " ".join(best_reasoning[:2])
 
         return {
-            "subject": best_subject,
-            "body": chosen_body["body"],
+            "subject": chosen_variant["subject"],
+            "body": chosen_variant["body"],
             "url": final_url,
-            "cta_text": chosen_body.get("cta_text") or GENERIC_FALLBACK_CTA_TEXT,
-            "selection_reason": selection_reason or "Selected for the strongest click-oriented structure.",
+            "cta_text": chosen_variant.get("cta_text") or GENERIC_FALLBACK_CTA_TEXT,
+            "selection_reason": resolved_reason,
             "product_name": product_context.get("product_name", ""),
             "approved_facts": product_context.get("approved_facts", []),
             "allowed_urls": product_context.get("allowed_urls", []),
+            "variant_scores": ranked_variants,
+            "validation_reports": validation_reports,
         }
 
     except Exception as exc:
