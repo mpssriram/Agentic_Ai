@@ -641,7 +641,7 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
         return current_content   # fall back to original if rewrite fails
 
 
-def run_optimization_loop(
+def _deprecated_run_optimization_loop(
     content: dict,
     audience: list,
     customer_ids: list,
@@ -798,4 +798,175 @@ def run_optimization_loop(
         "attempts":       attempts,
         "target_reached": target_reached,
         "logs":           all_logs,
+    }
+
+
+def run_optimization_loop(
+    content: dict,
+    audience: list,
+    customer_ids: list,
+    send_time: str,
+    *,
+    on_status: callable = None,
+    on_attempt: callable = None,
+) -> dict:
+    """
+    Closed autonomous optimization loop for a single segment / batch.
+
+    This override keeps all 3 attempts, even if the target is met early.
+    """
+    from agents.executor import execute_campaign, normalize_send_time
+
+    def _emit(msg: str):
+        if on_status:
+            on_status(msg)
+        print(f"[LOOP] {msg}")
+
+    send_time = normalize_send_time(send_time)
+    current_content = dict(content)
+    attempts: list[dict] = []
+    target_reached = False
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        _emit(f"Attempt {attempt}/{MAX_RETRIES} - sending campaign...")
+
+        try:
+            result = execute_campaign(
+                current_content,
+                audience,
+                customer_ids=customer_ids,
+                send_time=send_time,
+                approved=True,
+            )
+        except Exception as e:
+            attempt_record = {
+                "attempt": attempt,
+                "error": str(e),
+                "campaign_id": None,
+                "metrics": {
+                    "open_rate": 0.0,
+                    "click_rate": 0.0,
+                    "total_rows": 0,
+                    "recipient_count": 0,
+                },
+                "score": 0.0,
+                "content": current_content,
+                "target_reached": False,
+            }
+            _emit(f"Send failed on attempt {attempt}: {e}")
+            if on_attempt:
+                on_attempt(attempt_record, critique=str(e))
+            attempts.append(attempt_record)
+            break
+
+        if not result.get("success"):
+            err_msg = result.get("logs")
+            attempt_record = {
+                "attempt": attempt,
+                "error": err_msg,
+                "campaign_id": None,
+                "metrics": {
+                    "open_rate": 0.0,
+                    "click_rate": 0.0,
+                    "total_rows": 0,
+                    "recipient_count": 0,
+                },
+                "score": 0.0,
+                "content": current_content,
+                "target_reached": False,
+            }
+            _emit(f"Campaign send returned failure on attempt {attempt}: {err_msg}")
+            if on_attempt:
+                on_attempt(attempt_record, critique=err_msg)
+            attempts.append(attempt_record)
+            break
+
+        campaign_id = result.get("campaign_id") or (result.get("campaign_ids") or [None])[0]
+
+        _emit(f"Fetching performance report (campaign_id={campaign_id})...")
+        try:
+            metrics, _ = _poll_metrics_from_report(campaign_id)
+        except Exception as e:
+            _emit(f"Could not fetch report: {e}. Using zeroed metrics.")
+            metrics = {
+                "open_rate": 0.0,
+                "click_rate": 0.0,
+                "total_rows": 0,
+                "eo_y_count": 0,
+                "ec_y_count": 0,
+                "recipient_count": 0,
+            }
+
+        open_rate = metrics.get("open_rate", 0.0)
+        click_rate = metrics.get("click_rate", 0.0)
+        score = _campaign_score(metrics)
+        targets_met = open_rate >= OPEN_RATE_TARGET and click_rate >= CLICK_RATE_TARGET
+        _emit(f"Attempt {attempt} metrics - Open: {open_rate}%  Click: {click_rate}%")
+
+        attempt_record = {
+            "attempt": attempt,
+            "campaign_id": campaign_id,
+            "metrics": metrics,
+            "score": round(score, 2),
+            "content": dict(current_content),
+            "target_reached": targets_met,
+        }
+
+        critique = ""
+        if not targets_met and attempt < MAX_RETRIES:
+            critique_parts = []
+            if open_rate < OPEN_RATE_TARGET:
+                critique_parts.append(f"Open rate {open_rate}% is below target {OPEN_RATE_TARGET}%.")
+            if click_rate < CLICK_RATE_TARGET:
+                critique_parts.append(f"Click rate {click_rate}% is below target {CLICK_RATE_TARGET}%.")
+            critique = " ".join(critique_parts)
+        elif targets_met and attempt < MAX_RETRIES:
+            critique = (
+                "Targets were met on this attempt. Preserve the strongest conversion elements "
+                "and generate a fresh variation for the remaining loop."
+            )
+
+        if on_attempt:
+            on_attempt(attempt_record, critique=critique)
+        attempts.append(attempt_record)
+
+        if targets_met:
+            _emit(
+                f"Target reached on attempt {attempt}. Open {open_rate}% >= {OPEN_RATE_TARGET}% | "
+                f"Click {click_rate}% >= {CLICK_RATE_TARGET}%"
+            )
+            target_reached = True
+
+        if attempt == MAX_RETRIES:
+            if target_reached:
+                _emit(f"Completed all {MAX_RETRIES} optimization loops after reaching target during the run.")
+            else:
+                _emit(f"Completed all {MAX_RETRIES} optimization loops without hitting targets.")
+            time.sleep(1.5)
+            break
+
+        _emit(f"Rewriting email - {critique}")
+        current_content = _rewrite_email(current_content, metrics, critique)
+        _emit("New email written. Moving to next attempt...")
+        time.sleep(1.5)
+
+    all_logs = "\n".join(
+        f"Attempt {a['attempt']}: "
+        + (
+            f"campaign_id={a.get('campaign_id')} | "
+            f"open={a.get('metrics', {}).get('open_rate', 0)}% | "
+            f"click={a.get('metrics', {}).get('click_rate', 0)}% | "
+            f"score={a.get('score', 0)}"
+            if "metrics" in a
+            else f"ERROR: {a.get('error')}"
+        )
+        for a in attempts
+    )
+
+    return {
+        "success": True,
+        "final_content": current_content,
+        "attempts": attempts,
+        "target_reached": target_reached,
+        "logs": all_logs,
     }

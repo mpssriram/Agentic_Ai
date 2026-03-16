@@ -859,11 +859,11 @@ if st.session_state.get("campaign_executed"):
                                     st.session_state["segment_loop_running"] = None
 
                                     if results.get("target_reached"):
-                                        loop_status.update(label="Optimization target reached", state="complete", expanded=False)
-                                        render_alert("success", "Optimization complete", f"{segment_name} reached the defined target.")
+                                        loop_status.update(label="Optimization loops complete", state="complete", expanded=False)
+                                        render_alert("success", "Optimization complete", f"{segment_name} completed all 3 loops and reached the defined target during the run.")
                                     else:
                                         loop_status.update(label="Optimization cycle finished", state="complete", expanded=True)
-                                        render_alert("info", "Optimization cycle finished", f"Retries ended for {segment_name} before the full target was reached.")
+                                        render_alert("info", "Optimization cycle finished", f"All 3 loops completed for {segment_name} before the full target was reached.")
 
                                     st.rerun()
                                 except Exception as exc:
@@ -880,6 +880,7 @@ if st.session_state.get("campaign_executed"):
                         if loop_result:
                             with st.expander(f"View optimization logs for {segment_name}", expanded=False):
                                 st.markdown("### Micro-segment relaunch metrics")
+                                attempt_chart_rows = []
                                 for attempt in loop_result.get("attempts", []):
                                     st.markdown(f"**Attempt {attempt['attempt']}**")
                                     st.write(f"- Campaign ID: `{attempt.get('campaign_id')}`")
@@ -887,12 +888,29 @@ if st.session_state.get("campaign_executed"):
                                     st.write(f"- Open Rate: {attempt_metrics.get('open_rate')}% | Click Rate: {attempt_metrics.get('click_rate')}%")
                                     st.write(f"- Report rows: `{attempt_metrics.get('recipient_count', attempt_metrics.get('total_rows', 0))}`")
                                     st.write(f"- Performance Score: `{attempt.get('score')}`")
+                                    attempt_chart_rows.append(
+                                        {
+                                            "Attempt": f"Attempt {attempt['attempt']}",
+                                            "Open Rate": float(attempt_metrics.get("open_rate", 0) or 0),
+                                            "Click Rate": float(attempt_metrics.get("click_rate", 0) or 0),
+                                            "Score": float(attempt.get("score", 0) or 0),
+                                        }
+                                    )
                                     st.divider()
 
+                                if attempt_chart_rows:
+                                    st.markdown("### Performance trend")
+                                    st.line_chart(
+                                        attempt_chart_rows,
+                                        x="Attempt",
+                                        y=["Open Rate", "Click Rate", "Score"],
+                                        height=260,
+                                    )
+
                                 if loop_result.get("target_reached"):
-                                    render_alert("success", "Final payload met target", "The optimized payload reached the defined performance threshold.")
+                                    render_alert("success", "Target reached during loop", "All 3 loops ran, and at least one optimized payload reached the defined performance threshold.")
                                 else:
-                                    render_alert("warning", "Target not fully met", "Max retries were reached before the target was fully satisfied.")
+                                    render_alert("warning", "Target not fully met", "All 3 loops ran, but the target was not fully satisfied.")
 
                                 final_payload = loop_result.get("final_content") or segment
                                 html_data = wrap_as_html(final_payload)
