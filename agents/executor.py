@@ -19,6 +19,7 @@ from utils.ollama_client import ollama_chat
 # Paths resolved relative to this file so they work from any cwd
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 _SPEC_PATH = str(_REPO_ROOT / "data" / "superbfsi_api_spec.yaml")
+_LOCAL_COHORT_PATH = str(_REPO_ROOT / "customer_cohort.json")
 
 # show raw HTTP traffic from LangChain/OpenAPI toolkit
 langchain.debug = True
@@ -43,6 +44,8 @@ HACKATHON_POLICY = {
 }
 
 SEND_REQUEST_TIMEOUT_SECONDS = 30
+COHORT_FETCH_TIMEOUT_SECONDS = 10
+COHORT_FETCH_MAX_ATTEMPTS = 2
 GREEN_TRACE = "\033[92m"
 TRACE_RESET = "\033[0m"
 
@@ -230,6 +233,31 @@ def _agent_result_text(result: Any) -> str:
             if key in result and isinstance(result[key], str):
                 return result[key]
     return json.dumps(result, ensure_ascii=False, default=str)
+
+
+def _load_local_customer_cohort() -> list[dict]:
+    if not os.path.exists(_LOCAL_COHORT_PATH):
+        raise FileNotFoundError(f"Local cohort fallback file not found: {_LOCAL_COHORT_PATH}")
+
+    with open(_LOCAL_COHORT_PATH, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if isinstance(payload, list):
+        cohort = payload
+    elif isinstance(payload, dict):
+        cohort = (
+            payload.get("customers")
+            or payload.get("customer_cohort")
+            or payload.get("data")
+            or payload.get("results")
+        )
+    else:
+        cohort = None
+
+    if not isinstance(cohort, list):
+        raise ValueError("Unexpected local customer_cohort.json structure")
+
+    return [c for c in cohort if isinstance(c, dict)]
 
 
 def _build_openapi_agent(raw_spec: dict, api_key: str):
@@ -614,23 +642,26 @@ def fetch_customer_cohort_fresh() -> list[dict]:
     url = f"{base_url}/api/v1/get_customer_cohort"
     headers = {"Content-Type": "application/json", "X-API-Key": api_key}
 
-    # network calls can be flaky; retry a few times with exponential backoff
+    # Try the live API first, then fall back to the local cohort file if it times out.
     resp = None
-    for attempt in range(3):
+    last_error: Exception | None = None
+    for attempt in range(COHORT_FETCH_MAX_ATTEMPTS):
         try:
             print(f"[INFO] Fetching cohort from {url} (attempt {attempt+1})...")
-            resp = requests.get(url, headers=headers, timeout=30)
+            resp = requests.get(url, headers=headers, timeout=COHORT_FETCH_TIMEOUT_SECONDS)
             resp.raise_for_status()
             break
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
-            if attempt < 2:
+            last_error = e
+            if attempt < COHORT_FETCH_MAX_ATTEMPTS - 1:
                 print(f"[WARN] timeout fetching cohort (attempt {attempt+1}), retrying...")
                 time.sleep(2 ** attempt)
                 continue
             else:
                 print("[ERROR] network read timeout after all attempts.")
         except requests.RequestException as e:
-            if attempt < 2:
+            last_error = e
+            if attempt < COHORT_FETCH_MAX_ATTEMPTS - 1:
                 print(f"[WARN] error fetching cohort (attempt {attempt+1}): {e}; retrying...")
                 time.sleep(2 ** attempt)
                 continue
@@ -638,7 +669,14 @@ def fetch_customer_cohort_fresh() -> list[dict]:
                 print(f"[ERROR] request error after all attempts: {e}")
 
     if resp is None:
-        raise RuntimeError("Failed to fetch live customer cohort from CampaignX API after all retry attempts.")
+        print(f"[WARN] Using local cohort fallback from {_LOCAL_COHORT_PATH}")
+        try:
+            return _load_local_customer_cohort()
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "Failed to fetch live customer cohort from CampaignX API and could not load customer_cohort.json. "
+                f"Last network error: {last_error}. Fallback error: {fallback_exc}"
+            ) from fallback_exc
 
     payload = resp.json()
 

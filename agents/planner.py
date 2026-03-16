@@ -104,6 +104,24 @@ def plan_campaign(brief: str):
     try:
         raw = ollama_chat([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=512)
         plan = parser.parse(raw)
+        strategy = str(plan.get("strategy", "") or "").strip()
+        goals = [str(item).strip() for item in plan.get("goals", []) if str(item).strip()]
+        audience = [str(item).strip() for item in plan.get("target_audience", []) if str(item).strip()]
+
+        if not strategy:
+            audience_text = ", ".join(audience[:2]) if audience else "the selected audience"
+            plan["strategy"] = (
+                f"Launch a click-oriented email campaign for {audience_text}, "
+                "using clear value framing, a focused CTA, and a high-engagement send window."
+            )
+
+        if not goals:
+            plan["goals"] = [
+                "Improve click-through rate",
+                "Maintain a strong open rate",
+            ]
+        if not audience:
+            plan["target_audience"] = ["all customers"]
 
         st = plan.get("send_time", "")
         fmt = "%d:%m:%y %H:%M:%S"

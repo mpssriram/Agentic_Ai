@@ -1,6 +1,7 @@
 import html
 import os
 import pathlib
+from datetime import datetime, timedelta
 
 import langchain
 import streamlit as st
@@ -68,6 +69,21 @@ def _increment_processed_customers(customer_ids: list[str]) -> None:
     seen.update(str(customer_id) for customer_id in customer_ids if str(customer_id).strip())
     st.session_state["processed_customer_ids"] = sorted(seen)
     st.session_state["processed_customers"] = len(seen)
+
+
+def _format_send_time(send_time: str) -> str:
+    raw_value = str(send_time or "").strip()
+    if not raw_value:
+        return "-"
+    try:
+        parsed = datetime.strptime(raw_value, "%d:%m:%y %H:%M:%S")
+        return parsed.strftime("%d %b %Y, %I:%M %p")
+    except Exception:
+        return raw_value
+
+
+def _approval_send_time() -> str:
+    return (datetime.now() + timedelta(minutes=1)).strftime("%d:%m:%y %H:%M:%S")
 
 
 def render_summary_card(title: str, value: str, caption: str = "", tone: str = "default") -> None:
@@ -504,16 +520,21 @@ if "plan" in st.session_state:
 
     plan = st.session_state["plan"]
     content = st.session_state["content"]
+    audience_segments = plan.get("target_audience") or ["all customers"]
+    plan["target_audience"] = audience_segments
 
     strategy_col, content_col = st.columns(2, gap="large")
     with strategy_col:
+        strategy_text = str(plan.get("strategy", "") or "").strip() or "Planner did not return a strategy summary for this run."
+        goals_text = [str(item).strip() for item in plan.get("goals", []) if str(item).strip()]
+        formatted_send_time = _format_send_time(plan.get("send_time", ""))
+        plan["strategy"] = strategy_text
+        plan["goals"] = goals_text or ["Planner did not return explicit goals."]
+        plan["send_time"] = formatted_send_time
         st.markdown("**Campaign strategy**")
         st.write(f"**Strategy:** {plan.get('strategy', '—')}")
         st.write(f"**Goals:** {', '.join(plan.get('goals', []))}")
         st.write(f"**Send time:** `{plan.get('send_time', '—')}`")
-        st.markdown("**Target segments**")
-        for segment in plan.get("target_audience", []):
-            st.markdown(f"- {segment}")
 
     with content_col:
         st.markdown("**Generated email**")
@@ -521,8 +542,8 @@ if "plan" in st.session_state:
         st.write("**Body:**")
         st.markdown(content.get("body", ""))
         url = content.get("url", "")
-        if url and url not in content.get("body", ""):
-            st.write(f"**CTA:** [{url}]({url})")
+        if url:
+            st.write(f"**Review URL:** [{url}]({url})")
 
     render_section_heading(
         "Step 2B",
@@ -598,6 +619,7 @@ if "plan" in st.session_state:
         total = len(approved_ids)
         batch_size = 200
         batch_count = max(1, (total + batch_size - 1) // batch_size)
+        approved_send_time = _approval_send_time()
         campaign_ids, logs = [], []
 
         try:
@@ -608,15 +630,15 @@ if "plan" in st.session_state:
                 with st.spinner(f"Batch {batch_index + 1} is being scheduled"):
                     preview = execute_campaign(
                         content,
-                        plan["target_audience"],
-                        send_time=plan.get("send_time"),
+                        audience_segments,
+                        send_time=approved_send_time,
                         customer_ids=approved_ids[start:end],
                         approved=False,
                     )
                     result = execute_campaign(
                         content,
-                        plan["target_audience"],
-                        send_time=plan.get("send_time"),
+                        audience_segments,
+                        send_time=approved_send_time,
                         customer_ids=approved_ids[start:end],
                         approved=True,
                         approved_proposal=preview.get("validated_proposal"),
@@ -647,6 +669,7 @@ if "plan" in st.session_state:
                         "campaign_ids": campaign_ids,
                         "campaign_id": campaign_ids[-1] if campaign_ids else None,
                         "agent_logs": "\n".join(logs),
+                        "executed_send_time": approved_send_time,
                         "step": "executed",
                     }
                 )
