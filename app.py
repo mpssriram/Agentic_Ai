@@ -452,10 +452,49 @@ with st.form("campaign_brief_form", border=False):
         height=140,
         key="brief_input",
     )
+    settings_col_1, settings_col_2, settings_col_3 = st.columns(3)
+    with settings_col_1:
+        subject_count = st.slider(
+            "Subject options",
+            min_value=3,
+            max_value=10,
+            value=int(st.session_state.get("subject_count", 5)),
+            step=1,
+            help="How many subject-line options the creator should generate.",
+        )
+    with settings_col_2:
+        body_count = st.slider(
+            "Body options",
+            min_value=2,
+            max_value=10,
+            value=int(st.session_state.get("body_count", 3)),
+            step=1,
+            help="How many body-copy options the creator should generate.",
+        )
+    with settings_col_3:
+        tone = st.selectbox(
+            "Tone",
+            options=[
+                "trustworthy, clear, benefit-led",
+                "professional, concise, action-oriented",
+                "warm, reassuring, trust-first",
+                "direct, persuasive, click-focused",
+            ],
+            index=[
+                "trustworthy, clear, benefit-led",
+                "professional, concise, action-oriented",
+                "warm, reassuring, trust-first",
+                "direct, persuasive, click-focused",
+            ].index(st.session_state.get("tone_preference", "trustworthy, clear, benefit-led")),
+            help="Controls the writing style used by the creator.",
+        )
     submitted = st.form_submit_button("Plan and create campaign", type="primary")
 
 if brief != st.session_state.get("brief"):
     st.session_state["brief"] = brief
+st.session_state["subject_count"] = subject_count
+st.session_state["body_count"] = body_count
+st.session_state["tone_preference"] = tone
 
 if submitted:
     if brief.strip():
@@ -465,6 +504,12 @@ if submitted:
                 st.write("Planner is analyzing the brief.")
                 raw_planner_prompt = get_planner_prompt(brief)
                 plan = plan_campaign(brief)
+                plan["generation_config"] = {
+                    "subject_count": st.session_state.get("subject_count", 5),
+                    "body_count": st.session_state.get("body_count", 3),
+                    "tone": st.session_state.get("tone_preference", "trustworthy, clear, benefit-led"),
+                    "body_word_target": "60-110 words",
+                }
 
                 st.write("Creator is generating the email copy.")
                 content = create_content(plan, brief)
@@ -487,7 +532,7 @@ if submitted:
                 st.session_state.pop("approval_match_meta", None)
 
                 status.update(label="Campaign strategy ready", state="complete", expanded=False)
-                st.toast("Strategy generated successfully", icon="✅")
+                st.toast("Strategy generated successfully", icon="OK")
                 render_alert(
                     "info",
                     "Previous execution metrics were cleared",
@@ -532,18 +577,78 @@ if "plan" in st.session_state:
         plan["goals"] = goals_text or ["Planner did not return explicit goals."]
         plan["send_time"] = formatted_send_time
         st.markdown("**Campaign strategy**")
-        st.write(f"**Strategy:** {plan.get('strategy', '—')}")
+        st.write(f"**Strategy:** {plan.get('strategy', '-')}")
         st.write(f"**Goals:** {', '.join(plan.get('goals', []))}")
-        st.write(f"**Send time:** `{plan.get('send_time', '—')}`")
+        st.write(f"**Send time:** `{plan.get('send_time', '-')}`")
 
     with content_col:
         st.markdown("**Generated email**")
-        st.write(f"**Subject:** {content.get('subject', '—')}")
+        st.write(f"**Subject:** {content.get('subject', '-')}")
         st.write("**Body:**")
         st.markdown(content.get("body", ""))
         url = content.get("url", "")
         if url:
             st.write(f"**Review URL:** [{url}]({url})")
+
+    ranked_variants = content.get("variant_scores") or []
+    validation_reports = content.get("validation_reports") or []
+    if ranked_variants:
+        render_section_heading(
+            "Step 2A",
+            "Generated variants",
+            "Review the ranked candidate variants the creator considered before selecting the recommended email.",
+        )
+        st.caption(f"{len(ranked_variants)} ranked variants available for review.")
+
+        for index, ranked in enumerate(ranked_variants, start=1):
+            scores = ranked.get("scores", {})
+            reasoning = ranked.get("reasoning", {})
+            variant_label = ranked.get("variant_id", f"variant-{index}")
+            score_value = scores.get("overall", 0)
+            title = f"#{ranked.get('rank', index)} {variant_label}"
+            if index == 1:
+                title += " · Recommended"
+
+            with st.expander(title, expanded=index == 1):
+                left, right = st.columns([1.5, 1], gap="large")
+                with left:
+                    st.write(f"**Subject:** {ranked.get('subject', '-')}")
+                    st.write("**Body:**")
+                    st.markdown(ranked.get("body", ""))
+                    cta_url = ranked.get("cta_url", "")
+                    if cta_url:
+                        st.write(f"**CTA URL:** [{cta_url}]({cta_url})")
+                with right:
+                    st.write(f"**Overall score:** {score_value}")
+                    st.write(f"**Open likelihood:** {scores.get('open_rate_likelihood', 0)}")
+                    st.write(f"**Click likelihood:** {scores.get('click_rate_likelihood', 0)}")
+                    st.write(f"**Trustworthiness:** {scores.get('trustworthiness', 0)}")
+                    st.write(f"**Compliance safety:** {scores.get('compliance_safety', 0)}")
+
+                click_reasons = reasoning.get("click", [])
+                compliance_reasons = reasoning.get("compliance", [])
+                if click_reasons:
+                    st.write("**Click reasoning:**")
+                    for item in click_reasons:
+                        st.write(f"- {item}")
+                if compliance_reasons:
+                    st.write("**Compliance reasoning:**")
+                    for item in compliance_reasons:
+                        st.write(f"- {item}")
+
+                report = validation_reports[index - 1] if index - 1 < len(validation_reports) else {}
+                warnings = report.get("warnings", []) if isinstance(report, dict) else []
+                errors = report.get("errors", []) if isinstance(report, dict) else []
+                if warnings or errors:
+                    with st.expander("Validation details"):
+                        if errors:
+                            st.write("**Errors:**")
+                            for item in errors:
+                                st.write(f"- {item}")
+                        if warnings:
+                            st.write("**Warnings:**")
+                            for item in warnings:
+                                st.write(f"- {item}")
 
     render_section_heading(
         "Step 2B",
@@ -758,7 +863,7 @@ if st.session_state.get("campaign_executed"):
         with metric_1:
             render_summary_card("Open Rate", f"{open_rate:.1f}%", "Baseline across original campaign batches", tone="blue")
         with metric_2:
-            render_summary_card("CTR (Primary Metric)", f"{click_rate:.1f}%", "PRIMARY METRIC • Baseline across original campaign batches", tone="violet")
+            render_summary_card("CTR (Primary Metric)", f"{click_rate:.1f}%", "PRIMARY METRIC - Baseline across original campaign batches", tone="violet")
         with metric_3:
             render_summary_card("Optimization Score", f"{performance_score:.2f}", "Baseline score weighted more toward clicks than opens", tone="mint")
 
@@ -775,6 +880,68 @@ if st.session_state.get("campaign_executed"):
             with st.expander("Technical details", expanded=True):
                 st.code(optimized_data.get("logs", "No technical details available."))
                 st.json(metrics)
+
+        current_mail = st.session_state.get("content", {})
+        st.markdown("**Optimization dashboard**")
+        dashboard_tab, mail_tab = st.tabs(["Improvement graph", "Mail in use"])
+
+        with dashboard_tab:
+            chart_rows = [
+                {
+                    "Stage": "Baseline",
+                    "Open Rate": open_rate,
+                    "Click Rate": click_rate,
+                    "Score": float(performance_score or 0),
+                }
+            ]
+            best_attempt = None
+            for key in [item for item in st.session_state.keys() if item.startswith("loop_results_")]:
+                loop_result = st.session_state.get(key) or {}
+                for attempt in loop_result.get("attempts", []):
+                    if best_attempt is None or float(attempt.get("score", 0) or 0) > float(best_attempt.get("score", 0) or 0):
+                        best_attempt = attempt
+
+            if best_attempt:
+                best_metrics = best_attempt.get("metrics", {})
+                chart_rows.append(
+                    {
+                        "Stage": f"Best Relaunch (Attempt {best_attempt.get('attempt')})",
+                        "Open Rate": float(best_metrics.get("open_rate", 0) or 0),
+                        "Click Rate": float(best_metrics.get("click_rate", 0) or 0),
+                        "Score": float(best_attempt.get("score", 0) or 0),
+                    }
+                )
+
+            st.line_chart(chart_rows, x="Stage", y=["Open Rate", "Click Rate", "Score"], height=300)
+            if best_attempt:
+                best_metrics = best_attempt.get("metrics", {})
+                render_alert(
+                    "success",
+                    "Best observed improvement",
+                    (
+                        f"Best relaunch reached open rate {best_metrics.get('open_rate', 0)}%, "
+                        f"click rate {best_metrics.get('click_rate', 0)}%, "
+                        f"and score {best_attempt.get('score', 0)}."
+                    ),
+                )
+            else:
+                render_alert(
+                    "info",
+                    "Baseline only so far",
+                    "Run an autonomous optimization loop on a segment to compare baseline performance against relaunch results here.",
+                )
+
+        with mail_tab:
+            mail_left, mail_right = st.columns([1.6, 1], gap="large")
+            with mail_left:
+                st.markdown("**Current selected mail**")
+                st.write(f"**Subject:** {current_mail.get('subject', '-')}")
+                st.write("**Body:**")
+                st.markdown(current_mail.get("body", ""))
+            with mail_right:
+                render_summary_card("CTA URL", current_mail.get("url", "-") or "-", "mail currently being used in the workspace", tone="violet")
+                render_summary_card("CTA text", current_mail.get("cta_text", "-") or "-", "current action line", tone="amber")
+                render_summary_card("Selection basis", current_mail.get("selection_reason", "Top-ranked variant"), "why this mail is active", tone="mint")
 
         segments = optimized_data.get("optimized_content", {}).get("micro_segments", [])
         if segments:
@@ -795,7 +962,6 @@ if st.session_state.get("campaign_executed"):
                         st.markdown(f"`{raw_time}`")
 
                         segment_loop_running = st.session_state.get("segment_loop_running")
-                        segment_busy = segment_loop_running == index
 
                         if st.button("Run autonomous optimization", key=f"exec_{index}", width="stretch", disabled=bool(segment_loop_running)):
                             st.session_state["segment_loop_running"] = index
@@ -829,14 +995,14 @@ if st.session_state.get("campaign_executed"):
                                             score_delta = loop_score - previous["score"]
 
                                         st.markdown("#### Micro-segment relaunch metrics")
-                                        st.caption(f"{segment_name} • attempt {attempt_number}")
+                                        st.caption(f"{segment_name} - attempt {attempt_number}")
                                         progress_col_1, progress_col_2, progress_col_3 = st.columns(3)
                                         progress_col_1.metric("Open rate", f"{loop_metrics['open_rate']}%", delta=f"{open_delta:+.2f}%" if open_delta is not None else None)
                                         progress_col_2.metric("Click rate", f"{loop_metrics['click_rate']}%", delta=f"{click_delta:+.2f}%" if click_delta is not None else None)
                                         progress_col_3.metric("Score", f"{loop_score:.2f}", delta=f"{score_delta:+.2f}" if score_delta is not None else None)
                                         recipient_count = loop_metrics.get("recipient_count", loop_metrics.get("total_rows", 0))
                                         if recipient_count:
-                                            st.caption(f"Campaign `{data.get('campaign_id')}` • {recipient_count} report rows captured for this attempt")
+                                            st.caption(f"Campaign `{data.get('campaign_id')}` - {recipient_count} report rows captured for this attempt")
 
                                         if critique:
                                             render_alert("info", "AI insight", critique)
@@ -929,3 +1095,4 @@ if st.session_state.get("campaign_executed"):
                 height=180,
                 label_visibility="collapsed",
             )
+

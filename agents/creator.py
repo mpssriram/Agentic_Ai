@@ -131,12 +131,29 @@ def _infer_product_name(brief: str) -> str:
     return ""
 
 
+def _generation_config(plan: dict[str, Any]) -> dict[str, Any]:
+    raw = plan.get("generation_config") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    subject_count = int(raw.get("subject_count", 5) or 5)
+    body_count = int(raw.get("body_count", 3) or 3)
+    tone = str(raw.get("tone", "trustworthy, clear, benefit-led") or "trustworthy, clear, benefit-led").strip()
+    body_word_target = str(raw.get("body_word_target", "60-110 words") or "60-110 words").strip()
+    return {
+        "subject_count": max(3, min(subject_count, 10)),
+        "body_count": max(2, min(body_count, 10)),
+        "tone": tone,
+        "body_word_target": body_word_target,
+    }
+
+
 def _build_creator_prompt(plan: dict[str, Any], brief: str, product_context: dict[str, Any]) -> str:
     audience = ", ".join(plan.get("target_audience", [])) or "the intended audience from the campaign brief"
     send_time = plan.get("send_time", "")
     product_name = product_context.get("product_name") or "the promoted product or offer"
     approved_facts = product_context.get("approved_facts", [])
     allowed_urls = product_context.get("allowed_urls", [])
+    generation_config = _generation_config(plan)
 
     approved_facts_block = (
         "\n".join(f"- {fact}" for fact in approved_facts)
@@ -201,14 +218,18 @@ Hard rules:
 
 Writing rules:
 - Subject should be concrete and relevant to the brief.
-- Body should aim for 60 to 110 words.
+- Writing tone should follow this preference: {generation_config["tone"]}.
+- Body should aim for {generation_config["body_word_target"]}.
 - First sentence should quickly explain why the reader should care.
 - Use only facts that are in the brief or approved facts list.
 - If no approved URL is available, do not invent one and do not write a fake CTA link.
+- Keep subjects and bodies meaningfully different from each other.
+- Vary the subject styles across the set: include a mix of benefit-led, curiosity-led, segment-specific, and clarity-first options.
+- Vary the body angles across the set: different hooks, opening lines, and CTA phrasing.
 
 Create:
-- 5 subject lines
-- 3 body versions
+- {generation_config["subject_count"]} subject lines
+- {generation_config["body_count"]} body versions
 - choose 1 best subject and 1 best body version
 
 Return ONLY valid JSON with this exact structure:
