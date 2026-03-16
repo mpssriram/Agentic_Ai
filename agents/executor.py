@@ -3,8 +3,9 @@ import json
 import re
 import yaml
 import requests
+from functools import lru_cache
+from json import JSONDecodeError
 import time
-import pathlib
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, List, Optional
@@ -15,33 +16,18 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
 from langchain_core.outputs import ChatResult, ChatGeneration
 from utils.ollama_client import ollama_chat
+from utils.settings import get_cohort_fallback_path, get_hackathon_policy, get_spec_path
+from utils.text import extract_urls
 
 # Paths resolved relative to this file so they work from any cwd
-_REPO_ROOT = pathlib.Path(__file__).parent.parent
-_SPEC_PATH = str(_REPO_ROOT / "data" / "superbfsi_api_spec.yaml")
-_LOCAL_COHORT_PATH = str(_REPO_ROOT / "data" / "customer_cohort.json")
+_SPEC_PATH = get_spec_path()
+_LOCAL_COHORT_PATH = get_cohort_fallback_path()
 
-# show raw HTTP traffic from LangChain/OpenAPI toolkit
-langchain.debug = True
+# Keep LangChain debug logging opt-in so normal runs and demos stay readable.
+langchain.debug = os.getenv("LANGCHAIN_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-HACKATHON_POLICY = {
-    "allowed_url": None,
-    "allowed_execution_operations": {
-        "send_campaign": {
-            "method": "POST",
-            "paths": {"/api/v1/send_campaign"},
-            "required_payload_keys": {"subject", "body", "list_customer_ids", "send_time"},
-        },
-    },
-    "allowed_report_operations": {
-        "get_report": {
-            "method": "GET",
-            "paths": {"/api/v1/get_report"},
-            "required_query_keys": {"campaign_id"},
-        },
-    },
-}
+HACKATHON_POLICY = get_hackathon_policy()
 
 SEND_REQUEST_TIMEOUT_SECONDS = 30
 COHORT_FETCH_TIMEOUT_SECONDS = 10
@@ -172,12 +158,6 @@ def _normalize_path(path: str | None) -> str:
         parsed = requests.utils.urlparse(value)
         return parsed.path or value
     return value
-
-
-def _extract_urls(text: str) -> list[str]:
-    return re.findall(r"https?://[^\s<>\"]+", text or "")
-
-
 def _allowed_urls_from_content(content: dict | None) -> list[str]:
     if not isinstance(content, dict):
         return []
@@ -258,6 +238,20 @@ def _load_local_customer_cohort() -> list[dict]:
         raise ValueError("Unexpected local customer_cohort.json structure")
 
     return [c for c in cohort if isinstance(c, dict)]
+
+
+@lru_cache(maxsize=1)
+def _load_raw_spec() -> dict:
+    if not os.path.exists(_SPEC_PATH):
+        raise FileNotFoundError(f"superbfsi_api_spec.yaml not found at {_SPEC_PATH}.")
+
+    with open(_SPEC_PATH, "r", encoding="utf-8") as f:
+        payload = yaml.safe_load(f)
+
+    if not isinstance(payload, dict):
+        raise ValueError("OpenAPI spec did not load into a dictionary.")
+
+    return payload
 
 
 def _build_openapi_agent(raw_spec: dict, api_key: str):
@@ -479,7 +473,7 @@ def validate_api_call_proposal(
             raise ValueError(f"Proposal payload missing required keys: {missing}")
 
         body = str(payload.get("body", ""))
-        urls = _extract_urls(body)
+        urls = extract_urls(body)
 
         allowed_urls = []
         proposal_allowed_url = proposal.get("allowed_url")
@@ -627,17 +621,11 @@ def _spec_base_url(raw_spec: dict) -> str:
 
 
 def fetch_customer_cohort_fresh() -> list[dict]:
-    spec_path = _SPEC_PATH
-    if not os.path.exists(spec_path):
-        raise FileNotFoundError("superbfsi_api_spec.yaml not found.")
-
     api_key = os.getenv("CAMPAIGNX_API_KEY")
     if not api_key:
         raise ValueError("CAMPAIGNX_API_KEY not set.")
 
-    with open(spec_path, "r") as f:
-        raw_spec = yaml.safe_load(f)
-
+    raw_spec = _load_raw_spec()
     base_url = _spec_base_url(raw_spec)
     url = f"{base_url}/api/v1/get_customer_cohort"
     headers = {"Content-Type": "application/json", "X-API-Key": api_key}
@@ -678,7 +666,17 @@ def fetch_customer_cohort_fresh() -> list[dict]:
                 f"Last network error: {last_error}. Fallback error: {fallback_exc}"
             ) from fallback_exc
 
-    payload = resp.json()
+    try:
+        payload = resp.json()
+    except (ValueError, JSONDecodeError) as exc:
+        print(f"[WARN] Cohort response was not valid JSON. Using local cohort fallback from {_LOCAL_COHORT_PATH}")
+        try:
+            return _load_local_customer_cohort()
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "Customer cohort API returned a non-JSON response and local fallback loading failed. "
+                f"JSON error: {exc}. Fallback error: {fallback_exc}"
+            ) from fallback_exc
 
     if isinstance(payload, list):
         cohort = payload
@@ -693,7 +691,14 @@ def fetch_customer_cohort_fresh() -> list[dict]:
         cohort = None
 
     if not isinstance(cohort, list):
-        raise ValueError("Unexpected get_customer_cohort response shape")
+        print(f"[WARN] Unexpected cohort response shape. Using local cohort fallback from {_LOCAL_COHORT_PATH}")
+        try:
+            return _load_local_customer_cohort()
+        except Exception as fallback_exc:
+            raise ValueError(
+                "Unexpected get_customer_cohort response shape and local fallback loading failed. "
+                f"Fallback error: {fallback_exc}"
+            ) from fallback_exc
 
     return [c for c in cohort if isinstance(c, dict)]
 
@@ -830,7 +835,7 @@ def filter_customer_cohort(
                 continue
 
             kws = _segment_keywords(seg)
-            sample_blob = _customer_search_blob(cohort[0]) if cohort else ""
+            sample_blob = " ".join(_customer_search_blob(customer) for customer in cohort[: min(len(cohort), 25)])
             if kws and any(k in sample_blob for k in kws):
                 supported_segments.append(seg)
                 for customer in cohort:
@@ -969,37 +974,15 @@ def execute_campaign_batched(
     if not isinstance(customer_ids, list) or not all(isinstance(x, str) for x in customer_ids):
         raise ValueError("customer_ids must be a list of strings")
 
-    spec_path = _SPEC_PATH
-    if not os.path.exists(spec_path):
-        raise FileNotFoundError(f"superbfsi_api_spec.yaml not found at {spec_path}.")
-
-    api_key = os.getenv("CAMPAIGNX_API_KEY")
-    if not api_key:
-        raise ValueError("CAMPAIGNX_API_KEY not set.")
-
-    with open(spec_path, "r") as f:
-        raw_spec = yaml.safe_load(f)
-
-    # normalize send_time
     send_time = normalize_send_time(send_time)
-
-    cta_url = content.get("url", "")
-    cta_text = content.get("cta_text") or "Review details"
-    cta_placement = content.get("cta_placement", "end")
-    body = content.get('body', '') or ''
-    if "[Mandatory URL]" in body:
-        body = body.replace("[Mandatory URL]", cta_url)
-    body_with_cta = _compose_body_with_cta(body, cta_text, cta_url, cta_placement)
 
     batches = _chunks([str(x) for x in customer_ids], batch_size)
     campaign_ids: list[str] = []
     lines: list[str] = []
     previews: list[dict] = []
     for i, batch in enumerate(batches, start=1):
-        batch_content = dict(content)
-        batch_content["body"] = body_with_cta
         result = execute_campaign(
-            batch_content,
+            content,
             audience,
             send_time=send_time,
             customer_ids=batch,
@@ -1052,17 +1035,11 @@ def execute_campaign(
     """
     print(f"Executing campaign for {len(audience)} customers...")
 
-    spec_path = _SPEC_PATH
-    if not os.path.exists(spec_path):
-        raise FileNotFoundError(f"superbfsi_api_spec.yaml not found at {spec_path}.")
-
     api_key = os.getenv("CAMPAIGNX_API_KEY")
     if not api_key:
         raise ValueError("CAMPAIGNX_API_KEY not set.")
 
-    with open(spec_path, "r") as f:
-        raw_spec = yaml.safe_load(f)
-
+    raw_spec = _load_raw_spec()
     # compute or normalize send_time
     send_time = normalize_send_time(send_time)
 

@@ -54,6 +54,58 @@ DEFAULT_FALLBACK_COPY = {
     ],
     "cta_text": "Review details",
 }
+DEFAULT_CREATOR_POLICY = {
+    "disallowed_phrases": [
+        "dear valued customer",
+        "we are excited to inform you",
+        "unique opportunity",
+        "check this out",
+        "limited time only",
+        "act now",
+        "once in a lifetime",
+        "guaranteed returns",
+        "risk free",
+        "risk-free",
+        "double your money",
+        "instant approval guaranteed",
+    ],
+    "action_keywords": [
+        "review",
+        "compare",
+        "see",
+        "check",
+        "explore",
+        "visit",
+        "learn",
+        "apply",
+        "discover",
+        "find out",
+    ],
+    "minimum_english_letters": 10,
+    "subject_min_length": 6,
+    "subject_max_length": 120,
+    "default_subject_count": 5,
+    "default_body_count": 3,
+    "min_subject_count": 3,
+    "max_subject_count": 10,
+    "min_body_count": 2,
+    "max_body_count": 10,
+    "default_tone": "trustworthy, clear, benefit-led",
+    "default_body_word_target": "60-110 words",
+    "body_soft_word_limit": 130,
+    "body_trimmed_word_limit": 120,
+    "max_body_urls": 2,
+    "preferred_cta_placement": "end",
+    "subject_style_mix": [
+        "benefit-led",
+        "curiosity-led",
+        "segment-specific",
+        "clarity-first",
+    ],
+    "body_angle_guidance": "different hooks, opening lines, and CTA phrasing",
+    "default_selection_reason": "Selected for the strongest click-oriented structure.",
+    "fallback_selection_reason": "Fallback content used because model output was unavailable or invalid.",
+}
 
 
 def _parse_json_env(name: str) -> Any | None:
@@ -64,6 +116,17 @@ def _parse_json_env(name: str) -> Any | None:
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def get_allowed_cta_url() -> str:
@@ -136,4 +199,33 @@ def get_fallback_copy() -> dict[str, Any]:
     cta_text = str(parsed.get("cta_text", "")).strip()
     if cta_text:
         merged["cta_text"] = cta_text
+    return merged
+
+
+def get_creator_debug_enabled() -> bool:
+    return _parse_bool_env("CAMPAIGNX_DEBUG_CREATOR", False)
+
+
+def get_creator_policy() -> dict[str, Any]:
+    parsed = _parse_json_env("CAMPAIGNX_CREATOR_POLICY_JSON")
+    if not isinstance(parsed, dict):
+        return json.loads(json.dumps(DEFAULT_CREATOR_POLICY))
+
+    merged = json.loads(json.dumps(DEFAULT_CREATOR_POLICY))
+    for key, default_value in DEFAULT_CREATOR_POLICY.items():
+        if key not in parsed:
+            continue
+
+        value = parsed[key]
+        if isinstance(default_value, list) and isinstance(value, list):
+            cleaned = [str(item).strip() for item in value if str(item).strip()]
+            if cleaned:
+                merged[key] = cleaned
+        elif isinstance(default_value, int) and isinstance(value, int):
+            merged[key] = value
+        elif isinstance(default_value, str):
+            cleaned = str(value).strip()
+            if cleaned:
+                merged[key] = cleaned
+
     return merged

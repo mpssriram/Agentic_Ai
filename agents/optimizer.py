@@ -1,7 +1,6 @@
 import os
 import json
 import yaml
-import pathlib
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pydantic import BaseModel, Field
@@ -11,9 +10,9 @@ from agents.executor import (
     plan_api_call_from_spec,
     validate_api_call_proposal,
 )
+from utils.settings import get_spec_path
 
-_REPO_ROOT = pathlib.Path(__file__).parent.parent
-_SPEC_PATH = str(_REPO_ROOT / "data" / "superbfsi_api_spec.yaml")
+_SPEC_PATH = get_spec_path()
 OPTIMIZER_POLICY = {
     "allowed_url": None,
     "click_weight": 0.7,
@@ -520,166 +519,6 @@ def _rewrite_email(current_content: dict, metrics: dict, critique: str) -> dict:
     except Exception as e:
         print(f"[WARN] _rewrite_email failed: {e}")
         return current_content   # fall back to original if rewrite fails
-
-
-def _deprecated_run_optimization_loop(
-    content: dict,
-    audience: list,
-    customer_ids: list,
-    send_time: str,
-    *,
-    on_status: callable = None,
-    on_attempt: callable = None,
-) -> dict:
-    """
-    Closed autonomous optimization loop for a single segment / batch.
-
-    Flow per attempt:
-      1. send_campaign  → get campaign_id
-      2. get_report     → compute open_rate & click_rate
-      3. If targets met → done ✅
-      4. Else           → critique + rewrite via Creator Agent → retry
-
-    Args:
-        content      : email payload dict (subject, body, url)
-        audience     : list of audience segment strings
-        customer_ids : list of customer ID strings for this batch
-        send_time    : pre-normalised send_time string
-        on_status    : optional callback(msg: str) for live UI updates
-        on_attempt   : optional callback(attempt_data: dict, critique: str) for detailed UI 
-
-    Returns a dict with:
-        success        : bool
-        final_content  : last email payload used
-        attempts       : list of per-attempt dicts
-        target_reached : bool
-        logs           : combined log string
-    """
-    from agents.executor import execute_campaign, normalize_send_time
-
-    def _emit(msg: str):
-        if on_status:
-            on_status(msg)
-        print(f"[LOOP] {msg}")
-
-    send_time = normalize_send_time(send_time)
-    current_content = dict(content)
-    attempts = []
-    target_reached = False
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        _emit(f"🔄 Attempt {attempt}/{MAX_RETRIES} — sending campaign...")
-
-        # ── Step 1: send campaign ──────────────────────────────────────────
-        try:
-            result = execute_campaign(
-                current_content,
-                audience,
-                customer_ids=customer_ids,
-                send_time=send_time,
-                approved=True,
-            )
-        except Exception as e:
-            _emit(f"❌ Send failed on attempt {attempt}: {e}")
-            attempt_record = {
-                "attempt": attempt, "error": str(e), "campaign_id": None, 
-                "metrics": {"open_rate": 0.0, "click_rate": 0.0}, "score": 0.0, "content": current_content
-            }
-            if on_attempt: on_attempt(attempt_record, critique=str(e))
-            attempts.append(attempt_record)
-            break
-
-        if not result.get("success"):
-            _emit(f"❌ Campaign send returned failure on attempt {attempt}: {result.get('logs')}")
-            err_msg = result.get('logs')
-            attempt_record = {
-                "attempt": attempt, "error": err_msg, "campaign_id": None, 
-                "metrics": {"open_rate": 0.0, "click_rate": 0.0}, "score": 0.0, "content": current_content
-            }
-            if on_attempt: on_attempt(attempt_record, critique=err_msg)
-            attempts.append(attempt_record)
-            break
-
-        campaign_id = result.get("campaign_id") or (
-            result.get("campaign_ids") or [None]
-        )[0]
-
-        # ── Step 2: fetch report ───────────────────────────────────────────
-        _emit(f"📊 Fetching performance report (campaign_id={campaign_id})...")
-        try:
-            metrics, _ = _poll_metrics_from_report(campaign_id)
-        except Exception as e:
-            _emit(f"⚠️  Could not fetch report: {e}. Using zeroed metrics.")
-            metrics = {"open_rate": 0.0, "click_rate": 0.0, "total_rows": 0, "eo_y_count": 0, "ec_y_count": 0}
-
-        open_rate  = metrics.get("open_rate",  0.0)
-        click_rate = metrics.get("click_rate", 0.0)
-        _emit(f"📈 Attempt {attempt} metrics — Open: {open_rate}%  Click: {click_rate}%")
-
-        score = _campaign_score(metrics)
-        attempt_record = {
-            "attempt":     attempt,
-            "campaign_id": campaign_id,
-            "metrics":     metrics,
-            "score":       round(score, 2),
-            "content":     dict(current_content),
-        }
-        
-        # ── Evaluation logic (pre-compute critique for the callback) ──────
-        targets_met = open_rate >= OPEN_RATE_TARGET and click_rate >= CLICK_RATE_TARGET
-        
-        critique = ""
-        if not targets_met and attempt < MAX_RETRIES:
-            critique_parts = []
-            if open_rate < OPEN_RATE_TARGET:
-                critique_parts.append(f"Open rate {open_rate}% is below target {OPEN_RATE_TARGET}%.")
-            if click_rate < CLICK_RATE_TARGET:
-                critique_parts.append(f"Click rate {click_rate}% is below target {CLICK_RATE_TARGET}%.")
-            critique = " ".join(critique_parts)
-            
-        # ── CALL UI CALLBACK ───────────────────────────────────────────────
-        if on_attempt:
-            on_attempt(attempt_record, critique=critique)
-        
-        attempts.append(attempt_record)
-
-        # ── Step 3: evaluate targets ───────────────────────────────────────
-        if targets_met:
-            _emit(f"🎯 Target reached! Open {open_rate}% ≥ {OPEN_RATE_TARGET}%  "
-                  f"·  Click {click_rate}% ≥ {CLICK_RATE_TARGET}%")
-            target_reached = True
-            time.sleep(1.5) # Visual pacing
-            break
-
-        if attempt == MAX_RETRIES:
-            _emit(f"🛑 MAX_RETRIES ({MAX_RETRIES}) reached without hitting targets.")
-            time.sleep(1.5) # Visual pacing
-            break
-
-        # ── Step 4: critique + rewrite ─────────────────────────────────────
-        _emit(f"✍️  Rewriting email — {critique}")
-        current_content = _rewrite_email(current_content, metrics, critique)
-        _emit("📝 New email written. Moving to next attempt...")
-        
-        time.sleep(1.5) # Visual pacing
-
-    all_logs = "\n".join(
-        f"Attempt {a['attempt']}: "
-        + (f"campaign_id={a.get('campaign_id')} | "
-           f"open={a.get('metrics', {}).get('open_rate', 0)}% | "
-           f"click={a.get('metrics', {}).get('click_rate', 0)}% | "
-           f"score={a.get('score', 0)}"
-           if "metrics" in a else f"ERROR: {a.get('error')}")
-        for a in attempts
-    )
-
-    return {
-        "success":        True,
-        "final_content":  current_content,
-        "attempts":       attempts,
-        "target_reached": target_reached,
-        "logs":           all_logs,
-    }
 
 
 def run_optimization_loop(

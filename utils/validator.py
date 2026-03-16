@@ -6,7 +6,8 @@ import re
 import unicodedata
 from typing import Any, Mapping
 
-ALLOWED_CTA_URL = "https://superbfsi.com/xdeposit/explore/"
+from utils.settings import get_allowed_cta_url
+from utils.text import extract_urls, sentence_count
 
 OUTPUT_JSON_SCHEMA: dict[str, Any] = {
     "strategy_summary": "string",
@@ -46,7 +47,6 @@ OUTPUT_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-URL_RE = re.compile(r"https?://[^\s]+")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 SUPPORTED_CLAIM_GUARDRAILS = [
     "guaranteed returns",
@@ -83,17 +83,6 @@ def _is_allowed_body_char(char: str) -> bool:
     if category.startswith("L"):
         return False
     return True
-
-
-def _extract_urls(text: str) -> list[str]:
-    return URL_RE.findall(text or "")
-
-
-def _sentence_count(text: str) -> int:
-    parts = re.split(r"[.!?]+", text.strip())
-    return len([part for part in parts if part.strip()])
-
-
 def _all_required_paths_present(payload: Mapping[str, Any]) -> list[str]:
     missing = []
     for top_level_key in OUTPUT_JSON_SCHEMA.keys():
@@ -110,7 +99,7 @@ def validate_subject(subject: str) -> dict[str, Any]:
         errors.append("Subject must be a non-empty string.")
         return {"valid": False, "errors": errors, "warnings": warnings}
 
-    if _extract_urls(subject):
+    if extract_urls(subject):
         errors.append("Subject must not contain URLs.")
     if _contains_non_english_letters(subject):
         errors.append("Subject contains non-English text.")
@@ -122,9 +111,10 @@ def validate_subject(subject: str) -> dict[str, Any]:
     return {"valid": not errors, "errors": errors, "warnings": warnings}
 
 
-def validate_body(body: str, mandatory_cta: str = ALLOWED_CTA_URL) -> dict[str, Any]:
+def validate_body(body: str, mandatory_cta: str | None = None) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    mandatory_cta = mandatory_cta or get_allowed_cta_url()
 
     if not isinstance(body, str) or not body.strip():
         errors.append("Body must be a non-empty string.")
@@ -133,7 +123,7 @@ def validate_body(body: str, mandatory_cta: str = ALLOWED_CTA_URL) -> dict[str, 
     if HTML_TAG_RE.search(body):
         errors.append("Body must not contain HTML.")
 
-    urls = _extract_urls(body)
+    urls = extract_urls(body)
     invalid_urls = [url for url in urls if url != mandatory_cta]
     if invalid_urls:
         errors.append(f"Body contains extra URL(s): {invalid_urls}")
@@ -151,7 +141,7 @@ def validate_body(body: str, mandatory_cta: str = ALLOWED_CTA_URL) -> dict[str, 
         if forbidden_claim in lowered:
             errors.append(f"Body contains unsupported claim: {forbidden_claim}")
 
-    if _sentence_count(body.replace(mandatory_cta, "")) > 5:
+    if sentence_count(body.replace(mandatory_cta, "")) > 5:
         warnings.append("Body is long and may hurt click rate.")
 
     return {"valid": not errors, "errors": errors, "warnings": warnings}
@@ -160,10 +150,11 @@ def validate_body(body: str, mandatory_cta: str = ALLOWED_CTA_URL) -> dict[str, 
 def validate_variant(
     variant: Mapping[str, Any],
     *,
-    mandatory_cta: str = ALLOWED_CTA_URL,
+    mandatory_cta: str | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
+    mandatory_cta = mandatory_cta or get_allowed_cta_url()
 
     required_keys = [
         "variant_id",
@@ -202,7 +193,7 @@ def validate_variant(
                 warnings.append(f"Formatting hint phrase '{phrase}' not found in subject/body.")
 
     cta_used = bool(variant.get("cta_used"))
-    body_urls = _extract_urls(str(variant.get("body", "")))
+    body_urls = extract_urls(str(variant.get("body", "")))
     if cta_used and mandatory_cta not in body_urls:
         warnings.append("CTA marked as used but CTA URL is not present in body.")
     if not cta_used and mandatory_cta in body_urls:
@@ -227,12 +218,13 @@ def validate_variant(
 def validate_output_payload(
     payload: Mapping[str, Any],
     *,
-    mandatory_cta: str = ALLOWED_CTA_URL,
+    mandatory_cta: str | None = None,
     require_multiple_variants: bool = True,
 ) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     variant_reports: list[dict[str, Any]] = []
+    mandatory_cta = mandatory_cta or get_allowed_cta_url()
 
     missing_top_level = _all_required_paths_present(payload)
     if missing_top_level:
@@ -262,7 +254,7 @@ def validate_output_payload(
         for variant in variants
     )
     extra_url_present = any(
-        any(url != mandatory_cta for url in _extract_urls(str(variant.get("body", ""))))
+        any(url != mandatory_cta for url in extract_urls(str(variant.get("body", ""))))
         for variant in variants
     )
     unsupported_claims = any(

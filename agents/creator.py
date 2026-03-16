@@ -1,8 +1,11 @@
 import json
+import os
 import re
 from typing import Any
 
 from utils.scorer import rank_variants
+from utils.settings import get_fallback_copy
+from utils.text import extract_urls
 from utils.validator import validate_body, validate_subject
 
 try:
@@ -26,32 +29,17 @@ GENERIC_DISALLOWED_PHRASES = [
     "instant approval guaranteed",
 ]
 
-GENERIC_FALLBACK_SUBJECTS = [
-    "Review the latest offer details",
-    "A quick look at this new offer",
-    "See the details for this campaign",
-]
-
-GENERIC_FALLBACK_OPENERS = [
-    "Here is a quick summary of the offer and why it may be worth your attention.",
-    "Take a moment to review the main details of this offer.",
-]
-
-GENERIC_FALLBACK_SUPPORT_LINES = [
-    "The campaign highlights the main benefits clearly so you can review them quickly.",
-    "This message is designed to help you understand the offer before taking the next step.",
-]
-
-GENERIC_FALLBACK_CLOSERS = [
-    "Review the details and decide whether it fits your needs.",
-    "Take a look and see whether this offer is relevant for you.",
-]
-
-GENERIC_FALLBACK_CTA_TEXT = "Review details"
+FALLBACK_COPY = get_fallback_copy()
+GENERIC_FALLBACK_SUBJECTS = FALLBACK_COPY["subjects"]
+GENERIC_FALLBACK_OPENERS = FALLBACK_COPY["openers"]
+GENERIC_FALLBACK_SUPPORT_LINES = FALLBACK_COPY["support_lines"]
+GENERIC_FALLBACK_CLOSERS = FALLBACK_COPY["closers"]
+GENERIC_FALLBACK_CTA_TEXT = FALLBACK_COPY["cta_text"]
 
 
 def _creator_debug(message: str) -> None:
-    print(f"[DEBUG][CREATOR] {message}")
+    if os.getenv("CREATOR_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
+        print(f"[DEBUG][CREATOR] {message}")
 
 
 def _contains_html(text: str) -> bool:
@@ -72,23 +60,13 @@ def _normalize_whitespace(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
-
-def _extract_urls(text: str) -> list[str]:
-    seen: list[str] = []
-    for url in re.findall(r"https?://[^\s)>\]]+", text or ""):
-        if url not in seen:
-            seen.append(url)
-    return seen
-
-
 def _resolve_product_context(plan: dict[str, Any], brief: str) -> dict[str, Any]:
     product_context = plan.get("product_context") or {}
     if not isinstance(product_context, dict):
         product_context = {}
 
     approved_facts = product_context.get("approved_facts") or plan.get("approved_facts") or []
-    allowed_urls = product_context.get("allowed_urls") or plan.get("allowed_urls") or _extract_urls(brief)
+    allowed_urls = product_context.get("allowed_urls") or plan.get("allowed_urls") or extract_urls(brief, unique=True)
     product_name = (
         product_context.get("product_name")
         or plan.get("product_name")
@@ -268,7 +246,7 @@ def _contains_disallowed_phrase(text: str) -> bool:
 
 
 def _line_has_allowed_url(line: str, allowed_urls: list[str]) -> bool:
-    urls = _extract_urls(line)
+    urls = extract_urls(line, unique=True)
     if not urls:
         return True
     return all(url in allowed_urls for url in urls)
@@ -329,7 +307,7 @@ def _sanitize_body(
         if not _line_has_allowed_url(line, allowed_urls):
             continue
 
-        line_urls = _extract_urls(line)
+        line_urls = extract_urls(line, unique=True)
         if line_urls:
             for url in line_urls:
                 if url in allowed_urls and url not in url_lines:
@@ -360,7 +338,7 @@ def _sanitize_body(
         kept_lines.append(f"{fallback_cta_text}:")
 
     if allowed_urls:
-        existing_urls = _extract_urls("\n\n".join(kept_lines))
+        existing_urls = extract_urls("\n\n".join(kept_lines), unique=True)
         if not existing_urls:
             kept_lines.append(allowed_urls[0])
         elif len(existing_urls) > 2:
@@ -369,7 +347,7 @@ def _sanitize_body(
             rebuilt: list[str] = []
             seen_urls: list[str] = []
             for line in kept_lines:
-                urls = _extract_urls(line)
+                urls = extract_urls(line, unique=True)
                 if not urls:
                     rebuilt.append(line)
                     continue
@@ -516,7 +494,7 @@ def _select_best_variant(
     for version_id in ordered_ids:
         body_info = body_map[version_id]
         body = body_info["body"]
-        body_urls = _extract_urls(body)
+        body_urls = extract_urls(body, unique=True)
         matched_allowed_url = next((url for url in body_urls if url in allowed_urls), mandatory_cta)
         body_report = validate_body(body, mandatory_cta=matched_allowed_url)
         if not body_report["valid"]:
@@ -626,7 +604,7 @@ def create_content(plan: dict[str, Any], brief: str) -> dict[str, Any]:
             }
 
         allowed_urls = product_context.get("allowed_urls", [])
-        primary_url = _extract_urls(chosen_variant["body"])
+        primary_url = extract_urls(chosen_variant["body"], unique=True)
         final_url = primary_url[0] if primary_url else (allowed_urls[0] if allowed_urls else "")
         best_rank = ranked_variants[0] if ranked_variants else None
         best_reasoning = []

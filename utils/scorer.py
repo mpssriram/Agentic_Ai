@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping
 
+from utils.text import sentence_count
 
 SPAM_WORDS = {
     "guaranteed",
@@ -43,13 +44,6 @@ def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 def _word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9']+", text or ""))
-
-
-def _sentence_count(text: str) -> int:
-    parts = re.split(r"[.!?]+", (text or "").strip())
-    return len([part for part in parts if part.strip()])
-
-
 def _contains_any(text: str, phrases: set[str]) -> bool:
     lowered = (text or "").lower()
     return any(phrase in lowered for phrase in phrases)
@@ -84,8 +78,8 @@ def _subject_open_score(subject: str) -> tuple[float, list[str]]:
 def _body_click_score(body: str, cta_used: bool, cta_placement: str) -> tuple[float, list[str]]:
     score = 50.0
     reasons: list[str] = []
-    sentence_count = _sentence_count(body)
-    if 2 <= sentence_count <= 4:
+    body_sentence_count = sentence_count(body)
+    if 2 <= body_sentence_count <= 4:
         score += 15
         reasons.append("Body length is concise and skimmable.")
     else:

@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Callable
 from openai import OpenAI
 
 # Ollama OpenAI-compatible endpoint
-OLLAMA_BASE_URL = "http://localhost:11434/v1"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OLLAMA_DEBUG = os.getenv("CAMPAIGNX_DEBUG_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
 

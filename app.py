@@ -7,6 +7,8 @@ import langchain
 import streamlit as st
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from agents.creator import create_content
 from agents.executor import execute_campaign, fetch_customer_cohort_fresh, filter_customer_cohort
 from agents.optimizer import optimize_campaign, run_optimization_loop
@@ -86,15 +88,29 @@ def _approval_send_time() -> str:
     return (datetime.now() + timedelta(minutes=1)).strftime("%d:%m:%y %H:%M:%S")
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def render_summary_card(title: str, value: str, caption: str = "", tone: str = "default") -> None:
     st.markdown(
-        f"""
-        <div class="summary-card summary-card--{tone}">
-            <div class="summary-card__title">{html.escape(title)}</div>
-            <div class="summary-card__value">{html.escape(value)}</div>
-            <div class="summary-card__caption">{html.escape(caption)}</div>
-        </div>
-        """,
+        (
+            f'<div class="summary-card summary-card--{tone}">'
+            f'<div class="summary-card__title">{html.escape(title)}</div>'
+            f'<div class="summary-card__value">{html.escape(value)}</div>'
+            f'<div class="summary-card__caption">{html.escape(caption)}</div>'
+            "</div>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -106,13 +122,248 @@ def render_status_chips(chips: list[str]) -> None:
 
 def render_section_heading(step: str, title: str, description: str) -> None:
     st.markdown(
-        f"""
-        <div class="section-heading">
-            <div class="section-heading__eyebrow">{html.escape(step)}</div>
-            <h2>{html.escape(title)}</h2>
-            <p>{html.escape(description)}</p>
-        </div>
-        """,
+        (
+            '<div class="section-heading">'
+            f'<div class="section-heading__eyebrow">{html.escape(step)}</div>'
+            f"<h2>{html.escape(title)}</h2>"
+            f"<p>{html.escape(description)}</p>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_panel_intro(title: str, description: str = "", eyebrow: str = "Workspace") -> None:
+    st.markdown(
+        (
+            '<div class="panel-intro">'
+            f'<div class="panel-intro__eyebrow">{html.escape(eyebrow)}</div>'
+            f'<div class="panel-intro__title">{html.escape(title)}</div>'
+            f'<div class="panel-intro__text">{html.escape(description)}</div>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_spotlight_panel(title: str, description: str, facts: list[tuple[str, str]], *, eyebrow: str = "Stage") -> None:
+    facts_html = "".join(
+        (
+            '<div class="spotlight-fact">'
+            f'<div class="spotlight-fact__label">{html.escape(str(label))}</div>'
+            f'<div class="spotlight-fact__value">{html.escape(str(value))}</div>'
+            "</div>"
+        )
+        for label, value in facts
+    )
+    st.markdown(
+        (
+            '<div class="spotlight-panel">'
+            '<div class="spotlight-panel__copy">'
+            f'<div class="spotlight-panel__eyebrow">{html.escape(eyebrow)}</div>'
+            f'<div class="spotlight-panel__title">{html.escape(title)}</div>'
+            f'<div class="spotlight-panel__text">{html.escape(description)}</div>'
+            "</div>"
+            f'<div class="spotlight-panel__facts">{facts_html}</div>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_customer_preview(rows: list[dict[str, object]], *, max_rows: int = 12) -> None:
+    preview_rows = rows[:max_rows]
+    if not preview_rows:
+        st.markdown('<div class="rich-list__empty">No audience preview is available.</div>', unsafe_allow_html=True)
+        return
+
+    body_html = "".join(
+        (
+            "<tr>"
+            f'<td>{html.escape(str(row.get("name", "-") or "-"))}</td>'
+            f'<td>{html.escape(str(row.get("city", "-") or "-"))}</td>'
+            f'<td>{html.escape(str(row.get("occupation", "-") or "-"))}</td>'
+            f'<td>{html.escape(str(row.get("social_media_active", "-") or "-"))}</td>'
+            f'<td>{html.escape(str(row.get("kyc_status", "-") or "-"))}</td>'
+            f'<td>{html.escape(str(row.get("customer_id", "-") or "-"))}</td>'
+            "</tr>"
+        )
+        for row in preview_rows
+    )
+    st.markdown(
+        (
+            '<div class="audience-table">'
+            "<table>"
+            "<thead><tr>"
+            "<th>Name</th>"
+            "<th>City</th>"
+            "<th>Occupation</th>"
+            "<th>Social</th>"
+            "<th>KYC</th>"
+            "<th>Customer ID</th>"
+            "</tr></thead>"
+            f"<tbody>{body_html}</tbody>"
+            "</table>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    if len(rows) > max_rows:
+        st.caption(f"Showing {max_rows} of {len(rows)} matched customers.")
+
+
+def _body_to_html(text: str) -> str:
+    raw = str(text or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return "<p>-</p>"
+
+    blocks = []
+    for block in raw.split("\n\n"):
+        cleaned = block.strip()
+        if not cleaned:
+            continue
+        escaped = html.escape(cleaned).replace("\n", "<br>")
+        blocks.append(f"<p>{escaped}</p>")
+    return "".join(blocks) or "<p>-</p>"
+
+
+def _list_to_html(items: list[str], empty_label: str = "No details available.") -> str:
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+    if not cleaned:
+        return f'<div class="rich-list__empty">{html.escape(empty_label)}</div>'
+    return "<ul class=\"rich-list\">" + "".join(f"<li>{html.escape(item)}</li>" for item in cleaned) + "</ul>"
+
+
+def render_info_grid(items: list[tuple[str, str]]) -> None:
+    grid_html = "".join(
+        (
+            '<div class="info-item">'
+            f'<div class="info-item__label">{html.escape(str(label))}</div>'
+            f'<div class="info-item__value">{html.escape(str(value))}</div>'
+            "</div>"
+        )
+        for label, value in items
+    )
+    st.markdown('<div class="info-grid">' + grid_html + "</div>", unsafe_allow_html=True)
+
+
+def render_mail_frame(title: str, subject: str, body: str, *, eyebrow: str = "Email", note: str = "") -> None:
+    note_block = f'<div class="mail-frame__note">{html.escape(note)}</div>' if note else ""
+    st.markdown(
+        (
+            '<div class="mail-frame">'
+            f'<div class="mail-frame__eyebrow">{html.escape(eyebrow)}</div>'
+            f'<div class="mail-frame__title">{html.escape(title)}</div>'
+            f'<div class="mail-frame__subject">{html.escape(subject or "-")}</div>'
+            f'<div class="mail-frame__body">{_body_to_html(body)}</div>'
+            f"{note_block}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_copy_panel(title: str, body: str, *, eyebrow: str = "Summary") -> None:
+    st.markdown(
+        (
+            '<div class="copy-panel">'
+            f'<div class="copy-panel__eyebrow">{html.escape(eyebrow)}</div>'
+            f'<div class="copy-panel__title">{html.escape(title)}</div>'
+            f'<div class="copy-panel__body">{_body_to_html(body)}</div>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_variant_card(
+    ranked: dict[str, object],
+    report: dict[str, object] | None,
+    *,
+    recommended: bool = False,
+) -> None:
+    scores = ranked.get("scores", {}) or {}
+    reasoning = ranked.get("reasoning", {}) or {}
+    warnings = report.get("warnings", []) if isinstance(report, dict) else []
+    errors = report.get("errors", []) if isinstance(report, dict) else []
+    cta_url = str(ranked.get("cta_url", "") or "").strip()
+    cta_text = str(ranked.get("cta_text", "") or "").strip()
+    variant_label = str(ranked.get("variant_id", "variant") or "variant")
+    rank_value = str(ranked.get("rank", "-"))
+    overall = str(scores.get("overall", 0))
+    badge = '<span class="variant-card__badge">Recommended</span>' if recommended else ""
+    validation_state = "Needs attention" if errors else ("Review notes" if warnings else "Validated")
+    cta_block = (
+        (
+            '<div class="variant-card__cta">'
+            '<div class="info-item__label">CTA</div>'
+            f'<div class="variant-card__cta-line">{html.escape(cta_text or "Review details")}</div>'
+            f'<a href="{html.escape(cta_url)}" target="_blank">{html.escape(cta_url)}</a>'
+            "</div>"
+        )
+        if cta_url
+        else (
+            '<div class="variant-card__cta">'
+            '<div class="info-item__label">CTA</div>'
+            '<div class="variant-card__cta-line">No CTA URL attached</div>'
+            "</div>"
+        )
+    )
+
+    score_items = [
+        ("Overall", overall),
+        ("Open", str(scores.get("open_rate_likelihood", 0))),
+        ("Click", str(scores.get("click_rate_likelihood", 0))),
+        ("Trust", str(scores.get("trustworthiness", 0))),
+        ("Compliance", str(scores.get("compliance_safety", 0))),
+    ]
+    score_html = "".join(
+        (
+            '<div class="variant-stat">'
+            f'<div class="variant-stat__label">{html.escape(label)}</div>'
+            f'<div class="variant-stat__value">{html.escape(value)}</div>'
+            "</div>"
+        )
+        for label, value in score_items
+    )
+
+    st.markdown(
+        (
+            f'<div class="variant-card{" variant-card--recommended" if recommended else ""}">'
+            '<div class="variant-card__header">'
+            "<div>"
+            f'<div class="variant-card__eyebrow">Variant #{html.escape(rank_value)}</div>'
+            f'<div class="variant-card__title">{html.escape(variant_label)}</div>'
+            "</div>"
+            '<div class="variant-card__header-meta">'
+            f"{badge}"
+            f'<span class="variant-card__score">Score {html.escape(overall)}</span>'
+            "</div>"
+            "</div>"
+            f'<div class="variant-card__subject">{html.escape(str(ranked.get("subject", "-") or "-"))}</div>'
+            f'<div class="variant-card__body">{_body_to_html(str(ranked.get("body", "") or ""))}</div>'
+            f'<div class="variant-stat-grid">{score_html}</div>'
+            '<div class="variant-card__detail-grid">'
+            '<div class="variant-card__detail">'
+            '<div class="info-item__label">Click reasoning</div>'
+            f'{_list_to_html(reasoning.get("click", []) or [], "No click rationale was captured.")}'
+            "</div>"
+            '<div class="variant-card__detail">'
+            '<div class="info-item__label">Compliance reasoning</div>'
+            f'{_list_to_html(reasoning.get("compliance", []) or [], "No compliance rationale was captured.")}'
+            "</div>"
+            "</div>"
+            '<div class="variant-card__detail-grid">'
+            '<div class="variant-card__detail">'
+            '<div class="info-item__label">Validation</div>'
+            f'<div class="variant-card__validation">{html.escape(validation_state)}</div>'
+            f'{_list_to_html([str(item) for item in errors], "No blocking validation errors.")}'
+            f'{_list_to_html([str(item) for item in warnings], "No validation warnings.")}'
+            "</div>"
+            f'<div class="variant-card__detail">{cta_block}</div>'
+            "</div>"
+            "</div>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -125,13 +376,13 @@ def render_alert(kind: str, title: str, message: str, details: str | None = None
         "info": "Update",
     }.get(kind, "Update")
     st.markdown(
-        f"""
-        <div class="ui-alert ui-alert--{html.escape(kind)}">
-            <div class="ui-alert__kicker">{html.escape(kicker)}</div>
-            <div class="ui-alert__title">{html.escape(title)}</div>
-            <div class="ui-alert__body">{html.escape(message)}</div>
-        </div>
-        """,
+        (
+            f'<div class="ui-alert ui-alert--{html.escape(kind)}">'
+            f'<div class="ui-alert__kicker">{html.escape(kicker)}</div>'
+            f'<div class="ui-alert__title">{html.escape(title)}</div>'
+            f'<div class="ui-alert__body">{html.escape(message)}</div>'
+            "</div>"
+        ),
         unsafe_allow_html=True,
     )
     if details:
@@ -140,7 +391,7 @@ def render_alert(kind: str, title: str, message: str, details: str | None = None
 
 
 def render_workflow_sidebar(steps: list[str], current_step: int) -> None:
-    st.markdown('<div class="workflow-list">', unsafe_allow_html=True)
+    item_html = []
     for index, label in enumerate(steps):
         if index < current_step:
             state = "done"
@@ -151,16 +402,15 @@ def render_workflow_sidebar(steps: list[str], current_step: int) -> None:
         else:
             state = "upcoming"
             prefix = "Next"
-        st.markdown(
-            f"""
-            <div class="workflow-item workflow-item--{state}">
-                <div class="workflow-item__badge">{html.escape(prefix)}</div>
-                <div class="workflow-item__label">{html.escape(label)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+        item_html.append(
+            (
+                f'<div class="workflow-item workflow-item--{state}">'
+                f'<div class="workflow-item__badge">{html.escape(prefix)}</div>'
+                f'<div class="workflow-item__label">{html.escape(label)}</div>'
+                "</div>"
+            )
         )
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="workflow-list">' + "".join(item_html) + "</div>", unsafe_allow_html=True)
 
 
 def render_landing_page() -> None:
@@ -173,16 +423,16 @@ def render_landing_page() -> None:
         <div class="landing-shell">
             <div class="landing-hero">
                 <div class="landing-hero__eyebrow">CampaignX for SuperBFSI</div>
-                <h1>AI Marketing Workspace for email campaign execution</h1>
+                <h1>AI campaign studio for planning, approval, and optimization</h1>
                 <p>
                     Plan campaigns from a natural-language brief, generate email content,
                     review targeting with a human in the loop, execute in batches, and optimize performance
                     with agent-guided recommendations.
                 </p>
                 <div class="landing-pills">
-                    <span class="stat-chip">Email campaign only</span>
-                    <span class="stat-chip">Human approval required</span>
-                    <span class="stat-chip">Open and click optimization</span>
+                    <span class="stat-chip">Email campaigns</span>
+                    <span class="stat-chip">Human approval</span>
+                    <span class="stat-chip">Live optimization</span>
                 </div>
             </div>
         </div>
@@ -295,8 +545,7 @@ def render_landing_page() -> None:
             st.rerun()
 
 
-langchain.debug = True
-load_dotenv()
+langchain.debug = os.getenv("LANGCHAIN_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 st.set_page_config(
     page_title="CampaignX Workspace",
@@ -400,24 +649,6 @@ with st.sidebar:
         st.session_state.pop("approval_match_meta", None)
         st.rerun()
 
-st.markdown(
-    """
-    <div class="hero-shell">
-        <div>
-            <div class="hero-shell__eyebrow">Welcome back to CampaignX</div>
-            <h1>CampaignX Workspace</h1>
-            <p>Shape a campaign, review the AI strategy, and send with confidence from a workspace that feels calm and easy to use.</p>
-        </div>
-        <div class="hero-shell__meta">
-            <span class="stat-chip">Email only</span>
-            <span class="stat-chip">Human approval</span>
-            <span class="stat-chip">Any campaign brief</span>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
 total_selected = len(st.session_state.get("approved_customer_ids", []))
 goal_label = "Maximize opens and clicks"
 status_map = {
@@ -431,64 +662,128 @@ workflow_status = status_map.get(st.session_state.get("step"), "Drafting")
 if st.session_state.get("campaign_executed"):
     workflow_status = "Launched"
 
-card_1, card_2, card_3, card_4 = st.columns(4)
-with card_1:
-    render_summary_card("Target audience", f"{total_selected:,}" if total_selected else "1,000", "customers in the current flow", tone="blue")
-with card_2:
-    render_summary_card("Primary goal", goal_label, "current campaign objective", tone="amber")
-with card_3:
-    render_summary_card("Workflow status", workflow_status, "where this campaign stands", tone="violet")
-with card_4:
-    render_summary_card("Processed", str(st.session_state.get("processed_customers", 0)), "unique customers touched", tone="mint")
+content_snapshot = st.session_state.get("content", {}) or {}
+variant_snapshot = content_snapshot.get("variant_scores") or []
+variant_count = len(variant_snapshot) or (1 if content_snapshot else 0)
+st.markdown(
+    f"""
+    <div class="hero-shell">
+        <div class="hero-shell__content">
+            <div class="hero-shell__eyebrow">Campaign command center</div>
+            <h1>Plan, review, and launch with a cleaner workflow</h1>
+            <p>Turn a plain-English brief into a polished campaign, inspect the audience, and optimize performance from one focused workspace built for review, not just execution.</p>
+            <div class="hero-shell__meta">
+                <span class="stat-chip">Email campaigns</span>
+                <span class="stat-chip">Human approval</span>
+                <span class="stat-chip">Live optimization</span>
+            </div>
+        </div>
+        <div class="hero-fact-grid">
+            <div class="hero-fact">
+                <div class="hero-fact__label">Current stage</div>
+                <div class="hero-fact__value">{html.escape(workflow_status)}</div>
+            </div>
+            <div class="hero-fact">
+                <div class="hero-fact__label">Audience approved</div>
+                <div class="hero-fact__value">{html.escape(f"{total_selected:,}" if total_selected else "Pending")}</div>
+            </div>
+            <div class="hero-fact">
+                <div class="hero-fact__label">Variants ready</div>
+                <div class="hero-fact__value">{html.escape(str(variant_count))}</div>
+            </div>
+            <div class="hero-fact">
+                <div class="hero-fact__label">Processed</div>
+                <div class="hero-fact__value">{html.escape(str(st.session_state.get("processed_customers", 0)))}</div>
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-render_section_heading("Step 1", "Campaign brief", "")
+render_section_heading(
+    "Step 1",
+    "Campaign brief",
+    "Start with the business ask, then tune how much creative exploration the agents should do before the review screen.",
+)
 
 with st.form("campaign_brief_form", border=False):
-    st.caption("Write a short plain-English campaign request. The system will expand it into the full internal prompt.")
-    brief = st.text_area(
-        "Describe your campaign goal",
-        value=st.session_state.get("brief", ""),
-        placeholder="Example: Promote a savings product to inactive customers and improve click-through.",
-        height=140,
-        key="brief_input",
-    )
-    settings_col_1, settings_col_2, settings_col_3 = st.columns(3)
-    with settings_col_1:
-        subject_count = st.slider(
+    tone_options = [
+        "trustworthy, clear, benefit-led",
+        "professional, concise, action-oriented",
+        "warm, reassuring, trust-first",
+        "direct, persuasive, click-focused",
+    ]
+    saved_tone = st.session_state.get("tone_preference", tone_options[0])
+    if saved_tone not in tone_options:
+        saved_tone = tone_options[0]
+    saved_subject_count = _safe_int(st.session_state.get("subject_count", 5) or 5, default=5)
+    saved_body_count = _safe_int(st.session_state.get("body_count", 3) or 3, default=3)
+    saved_subject_count = min(10, max(3, saved_subject_count))
+    saved_body_count = min(10, max(2, saved_body_count))
+
+    brief_col, settings_col = st.columns([1.55, 0.95], gap="large")
+    with brief_col:
+        render_panel_intro(
+            "Describe the campaign ask",
+            "Write the business request in plain English. The planner expands it into strategy, and the creator turns that into review-ready campaign copy.",
+            eyebrow="Campaign brief",
+        )
+        brief = st.text_area(
+            "Describe your campaign goal",
+            value=st.session_state.get("brief", ""),
+            placeholder="Example: Promote a savings product to inactive customers and improve click-through.",
+            height=240,
+            key="brief_input",
+            label_visibility="visible",
+        )
+        st.caption("Good briefs usually mention the product, target customer intent, and the main outcome you care about.")
+
+    with settings_col:
+        render_panel_intro(
+            "Generation controls",
+            "Control how much creative exploration the system should do before it hands the campaign to review.",
+            eyebrow="Controls",
+        )
+        subject_count = st.select_slider(
             "Subject options",
-            min_value=3,
-            max_value=10,
-            value=int(st.session_state.get("subject_count", 5)),
-            step=1,
+            options=list(range(3, 11)),
+            value=saved_subject_count,
             help="How many subject-line options the creator should generate.",
         )
-    with settings_col_2:
-        body_count = st.slider(
+        body_count = st.select_slider(
             "Body options",
-            min_value=2,
-            max_value=10,
-            value=int(st.session_state.get("body_count", 3)),
-            step=1,
+            options=list(range(2, 11)),
+            value=saved_body_count,
             help="How many body-copy options the creator should generate.",
         )
-    with settings_col_3:
         tone = st.selectbox(
             "Tone",
-            options=[
-                "trustworthy, clear, benefit-led",
-                "professional, concise, action-oriented",
-                "warm, reassuring, trust-first",
-                "direct, persuasive, click-focused",
-            ],
-            index=[
-                "trustworthy, clear, benefit-led",
-                "professional, concise, action-oriented",
-                "warm, reassuring, trust-first",
-                "direct, persuasive, click-focused",
-            ].index(st.session_state.get("tone_preference", "trustworthy, clear, benefit-led")),
+            options=tone_options,
+            index=tone_options.index(saved_tone),
             help="Controls the writing style used by the creator.",
         )
-    submitted = st.form_submit_button("Plan and create campaign", type="primary")
+        render_info_grid(
+            [
+                ("Approval model", "Human gate before launch"),
+                ("Execution model", "Batches of 200"),
+                ("Creative breadth", f"{subject_count} subjects / {body_count} bodies"),
+                ("Primary goal", goal_label),
+            ]
+        )
+
+    action_col, note_col = st.columns([0.36, 0.64], gap="large")
+    with action_col:
+        submitted = st.form_submit_button("Plan and create campaign", type="primary", width="stretch")
+    with note_col:
+        st.markdown(
+            """
+            <div class="form-footnote">
+                The system will plan the audience and strategy, generate ranked email options, validate them, and stop at the human approval step before anything is launched.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 if brief != st.session_state.get("brief"):
     st.session_state["brief"] = brief
@@ -532,7 +827,7 @@ if submitted:
                 st.session_state.pop("approval_match_meta", None)
 
                 status.update(label="Campaign strategy ready", state="complete", expanded=False)
-                st.toast("Strategy generated successfully", icon="OK")
+                st.toast("Strategy generated successfully", icon=":material/check_circle:")
                 render_alert(
                     "info",
                     "Previous execution metrics were cleared",
@@ -552,109 +847,32 @@ if submitted:
     else:
         render_alert("warning", "Brief needed", "Enter a campaign brief before asking the agents to create content.")
 
-if "plan" in st.session_state:
+if "plan" in st.session_state and "content" not in st.session_state:
+    render_alert(
+        "warning",
+        "Review state was incomplete",
+        "A partial campaign state was found in the session, so the review workspace was reset. Generate the campaign again to continue cleanly.",
+    )
+    st.session_state.pop("plan", None)
+    st.session_state.pop("step", None)
+
+if "plan" in st.session_state and "content" in st.session_state:
     render_section_heading(
         "Step 2",
         "Strategy and content review",
         "Review the generated campaign plan, target segments, send time, and email draft before approval.",
     )
 
-    if st.session_state.get("raw_planner_prompt"):
-        with st.expander("View planner prompt"):
-            st.code(st.session_state["raw_planner_prompt"], language="markdown")
-
     plan = st.session_state["plan"]
     content = st.session_state["content"]
     audience_segments = plan.get("target_audience") or ["all customers"]
+    strategy_text = str(plan.get("strategy", "") or "").strip() or "Planner did not return a strategy summary for this run."
+    goals_text = [str(item).strip() for item in plan.get("goals", []) if str(item).strip()]
+    formatted_send_time = _format_send_time(plan.get("send_time", ""))
     plan["target_audience"] = audience_segments
-
-    strategy_col, content_col = st.columns(2, gap="large")
-    with strategy_col:
-        strategy_text = str(plan.get("strategy", "") or "").strip() or "Planner did not return a strategy summary for this run."
-        goals_text = [str(item).strip() for item in plan.get("goals", []) if str(item).strip()]
-        formatted_send_time = _format_send_time(plan.get("send_time", ""))
-        plan["strategy"] = strategy_text
-        plan["goals"] = goals_text or ["Planner did not return explicit goals."]
-        plan["send_time"] = formatted_send_time
-        st.markdown("**Campaign strategy**")
-        st.write(f"**Strategy:** {plan.get('strategy', '-')}")
-        st.write(f"**Goals:** {', '.join(plan.get('goals', []))}")
-        st.write(f"**Send time:** `{plan.get('send_time', '-')}`")
-
-    with content_col:
-        st.markdown("**Generated email**")
-        st.write(f"**Subject:** {content.get('subject', '-')}")
-        st.write("**Body:**")
-        st.markdown(content.get("body", ""))
-        url = content.get("url", "")
-        if url:
-            st.write(f"**Review URL:** [{url}]({url})")
-
-    ranked_variants = content.get("variant_scores") or []
-    validation_reports = content.get("validation_reports") or []
-    if ranked_variants:
-        render_section_heading(
-            "Step 2A",
-            "Generated variants",
-            "Review the ranked candidate variants the creator considered before selecting the recommended email.",
-        )
-        st.caption(f"{len(ranked_variants)} ranked variants available for review.")
-
-        for index, ranked in enumerate(ranked_variants, start=1):
-            scores = ranked.get("scores", {})
-            reasoning = ranked.get("reasoning", {})
-            variant_label = ranked.get("variant_id", f"variant-{index}")
-            score_value = scores.get("overall", 0)
-            title = f"#{ranked.get('rank', index)} {variant_label}"
-            if index == 1:
-                title += " · Recommended"
-
-            with st.expander(title, expanded=index == 1):
-                left, right = st.columns([1.5, 1], gap="large")
-                with left:
-                    st.write(f"**Subject:** {ranked.get('subject', '-')}")
-                    st.write("**Body:**")
-                    st.markdown(ranked.get("body", ""))
-                    cta_url = ranked.get("cta_url", "")
-                    if cta_url:
-                        st.write(f"**CTA URL:** [{cta_url}]({cta_url})")
-                with right:
-                    st.write(f"**Overall score:** {score_value}")
-                    st.write(f"**Open likelihood:** {scores.get('open_rate_likelihood', 0)}")
-                    st.write(f"**Click likelihood:** {scores.get('click_rate_likelihood', 0)}")
-                    st.write(f"**Trustworthiness:** {scores.get('trustworthiness', 0)}")
-                    st.write(f"**Compliance safety:** {scores.get('compliance_safety', 0)}")
-
-                click_reasons = reasoning.get("click", [])
-                compliance_reasons = reasoning.get("compliance", [])
-                if click_reasons:
-                    st.write("**Click reasoning:**")
-                    for item in click_reasons:
-                        st.write(f"- {item}")
-                if compliance_reasons:
-                    st.write("**Compliance reasoning:**")
-                    for item in compliance_reasons:
-                        st.write(f"- {item}")
-
-                report = validation_reports[index - 1] if index - 1 < len(validation_reports) else {}
-                warnings = report.get("warnings", []) if isinstance(report, dict) else []
-                errors = report.get("errors", []) if isinstance(report, dict) else []
-                if warnings or errors:
-                    with st.expander("Validation details"):
-                        if errors:
-                            st.write("**Errors:**")
-                            for item in errors:
-                                st.write(f"- {item}")
-                        if warnings:
-                            st.write("**Warnings:**")
-                            for item in warnings:
-                                st.write(f"- {item}")
-
-    render_section_heading(
-        "Step 2B",
-        "Human approval",
-        "Inspect the matched audience and confirm the campaign before any batch is scheduled.",
-    )
+    plan["strategy"] = strategy_text
+    plan["goals"] = goals_text or ["Planner did not return explicit goals."]
+    plan["send_time"] = formatted_send_time
 
     if "approved_customer_ids" not in st.session_state:
         with st.spinner("Fetching customer cohort"):
@@ -676,133 +894,259 @@ if "plan" in st.session_state:
     approved_customers = st.session_state.get("approved_customers", [])
     approval_meta = st.session_state.get("approval_match_meta", {})
     schema_fallback_used = bool(approval_meta.get("schema_fallback_used"))
+    approval_state = "Fallback ready" if schema_fallback_used and approved_ids else ("Ready" if approved_ids else "No match")
+    batch_count = max(1, (len(approved_ids) + 199) // 200) if approved_ids else 0
 
-    approval_card_1, approval_card_2, approval_card_3 = st.columns(3)
-    with approval_card_1:
-        render_summary_card("Matched customers", str(len(approved_ids)), "current approved audience", tone="blue")
-    with approval_card_2:
-        batches = max(1, (len(approved_ids) + 199) // 200)
-        render_summary_card("Batches", str(batches), "campaigns scheduled in groups of 200", tone="amber")
-    with approval_card_3:
-        approval_state = "Fallback ready" if schema_fallback_used and approved_ids else ("Ready" if approved_ids else "No match")
-        render_summary_card("Approval state", approval_state, "audience validation result", tone="violet")
+    ranked_variants = content.get("variant_scores") or []
+    validation_reports = content.get("validation_reports") or []
 
-    if approved_customers:
-        st.markdown("**Matched customer list**")
-        rows = [
-            {
-                "customer_id": customer.get("customer_id") or customer.get("id") or customer.get("customerId"),
-                "name": customer.get("Full_Name") or customer.get("Full_name") or customer.get("full_name") or customer.get("fullName") or customer.get("name") or customer.get("email") or "-",
-                "city": customer.get("City") or customer.get("city") or "-",
-                "occupation": customer.get("Occupation") or customer.get("occupation") or customer.get("Occupation type") or customer.get("occupation_type") or "-",
-                "social_media_active": customer.get("Social_Media_Active") or "-",
-                "kyc_status": customer.get("KYC status") or customer.get("kyc_status") or customer.get("KYC_status") or "-",
-            }
-            for customer in approved_customers
-        ]
-        st.dataframe(rows, width="stretch", hide_index=True)
-    elif approved_ids:
-        render_alert("info", "ID-only audience loaded", f"{len(approved_ids)} matched customers were returned without full profile details.")
-    else:
-        render_alert("info", "No matched customers yet", "The current segment rules did not match any customers in the fetched cohort.")
+    render_spotlight_panel(
+        "Review workspace",
+        "This is the handoff layer between generation and execution: strategy, selected mail, variant rationale, and audience approval now sit on one presentation-ready surface.",
+        [
+            ("Send time", str(plan.get("send_time", "-"))),
+            ("Audience segments", str(len(audience_segments))),
+            ("Variants", str(len(ranked_variants) or 1)),
+            ("Approval state", approval_state),
+        ],
+        eyebrow="Review",
+    )
 
-    if schema_fallback_used:
-        unsupported = approval_meta.get("unsupported_segments") or []
-        notes = approval_meta.get("matching_notes") or []
-        message = "Requested marketing segments could not be proven from the current cohort fields, so the full cohort was used to keep testing unblocked."
-        if unsupported:
-            message += f" Unsupported segments: {', '.join(unsupported)}."
-        render_alert("warning", "Schema-aware fallback used", message, "\n".join(notes) if notes else None)
+    review_card_1, review_card_2, review_card_3, review_card_4 = st.columns(4)
+    with review_card_1:
+        render_summary_card("Audience segments", str(len(audience_segments)), "planner-defined audience groups", tone="blue")
+    with review_card_2:
+        render_summary_card("Goals", str(len(plan.get("goals", []))), "optimization goals in the current brief", tone="amber")
+    with review_card_3:
+        render_summary_card("Generated variants", str(len(ranked_variants) or 1), "candidate emails available for review", tone="violet")
+    with review_card_4:
+        render_summary_card("Approval state", approval_state, "current readiness before launch", tone="mint")
 
-    approve_col, reject_col, _ = st.columns([1, 1, 4])
-    execution_in_progress = st.session_state.get("execution_in_progress", False)
+    variant_tab_label = f"Variant studio ({len(ranked_variants) or 1})"
+    blueprint_tab, selected_mail_tab, variants_tab, audience_tab = st.tabs(
+        ["Campaign blueprint", "Selected email", variant_tab_label, "Audience approval"]
+    )
 
-    if approve_col.button("Approve and execute", type="primary", disabled=not bool(approved_ids) or execution_in_progress):
-        st.session_state["execution_in_progress"] = True
-        status_box = st.empty()
-        progress = st.progress(0)
-        total = len(approved_ids)
-        batch_size = 200
-        batch_count = max(1, (total + batch_size - 1) // batch_size)
-        approved_send_time = _approval_send_time()
-        campaign_ids, logs = [], []
+    with blueprint_tab:
+        render_panel_intro(
+            "Campaign blueprint",
+            "Use this space to understand the planner output, segment strategy, and prompt context before reviewing the final email.",
+            eyebrow="Strategy",
+        )
+        blueprint_left, blueprint_right = st.columns([1.2, 1], gap="large")
+        with blueprint_left:
+            render_copy_panel("Strategy narrative", plan.get("strategy", "-"), eyebrow="Planner output")
+            st.markdown("**Primary goals**")
+            render_status_chips(plan.get("goals", []))
+        with blueprint_right:
+            render_info_grid(
+                [
+                    ("Planned send time", plan.get("send_time", "-")),
+                    ("Audience count", str(len(audience_segments))),
+                    ("Allowed URLs", str(len(content.get("allowed_urls", []) or []))),
+                    ("Approved facts", str(len(content.get("approved_facts", []) or []))),
+                ]
+            )
+            st.markdown("**Audience segments**")
+            render_status_chips(audience_segments)
+            if st.session_state.get("raw_planner_prompt"):
+                with st.expander("View planner prompt", expanded=False):
+                    st.code(st.session_state["raw_planner_prompt"], language="markdown")
 
-        try:
-            for batch_index in range(batch_count):
-                start = batch_index * batch_size
-                end = min((batch_index + 1) * batch_size, total)
-                status_box.info(f"Scheduling batch {batch_index + 1} of {batch_count}")
-                with st.spinner(f"Batch {batch_index + 1} is being scheduled"):
-                    preview = execute_campaign(
-                        content,
-                        audience_segments,
-                        send_time=approved_send_time,
-                        customer_ids=approved_ids[start:end],
-                        approved=False,
-                    )
-                    result = execute_campaign(
-                        content,
-                        audience_segments,
-                        send_time=approved_send_time,
-                        customer_ids=approved_ids[start:end],
-                        approved=True,
-                        approved_proposal=preview.get("validated_proposal"),
-                    )
+    with selected_mail_tab:
+        render_panel_intro(
+            "Selected email",
+            "This draft is currently active in the workflow. It already won the creator ranking pass and is ready for human review.",
+            eyebrow="Recommended output",
+        )
+        mail_meta_left, mail_meta_right, mail_meta_third = st.columns(3, gap="large")
+        with mail_meta_left:
+            render_summary_card("CTA text", content.get("cta_text", "-") or "-", "current action line", tone="blue")
+        with mail_meta_right:
+            render_summary_card("Review URL", content.get("url", "-") or "-", "destination attached to this mail", tone="amber")
+        with mail_meta_third:
+            render_summary_card("Selection basis", content.get("selection_reason", "Top-ranked variant"), "why this mail won", tone="violet")
 
-                if not result.get("success"):
-                    st.session_state["execution_in_progress"] = False
-                    render_alert(
-                        "error",
-                        f"Batch {batch_index + 1} could not be scheduled",
-                        "The campaign stopped before all batches were queued.",
-                        str(result.get("logs")),
-                    )
-                    break
+        render_mail_frame(
+            "Recommended email draft",
+            str(content.get("subject", "-") or "-"),
+            str(content.get("body", "") or ""),
+            eyebrow="Current mail in use",
+            note=str(content.get("selection_reason", "") or ""),
+        )
 
-                if result.get("campaign_id"):
-                    campaign_ids.append(result["campaign_id"])
-                if result.get("logs"):
-                    logs.append(f"Batch {batch_index + 1}: {result['logs']}")
+        facts_col, details_col = st.columns([1.1, 1], gap="large")
+        with facts_col:
+            render_panel_intro("Approved facts in play", "These are the product facts the creator was allowed to use while writing the email.", eyebrow="Guardrails")
+            st.markdown(
+                _list_to_html([str(item) for item in content.get("approved_facts", []) or []], "No approved facts were attached."),
+                unsafe_allow_html=True,
+            )
+        with details_col:
+            render_panel_intro("Mail details", "Key properties of the selected draft.", eyebrow="Metadata")
+            render_info_grid(
+                [
+                    ("Product name", str(content.get("product_name", "-") or "-")),
+                    ("Allowed URL count", str(len(content.get("allowed_urls", []) or []))),
+                    ("Variant shortlist size", str(len(ranked_variants) or 1)),
+                    ("Selection source", "Creator ranking flow"),
+                ]
+            )
+    with variants_tab:
+        render_panel_intro(
+            "Variant studio",
+            "The creator scored and filtered every candidate before picking the recommended draft. This view lets you inspect those alternatives in full instead of reading them through stacked expanders.",
+            eyebrow="Creator review",
+        )
+        if ranked_variants:
+            st.caption(f"{len(ranked_variants)} ranked variants are available for review.")
+            for index, ranked in enumerate(ranked_variants, start=1):
+                report = validation_reports[index - 1] if index - 1 < len(validation_reports) else {}
+                render_variant_card(ranked, report, recommended=index == 1)
+        else:
+            render_alert("info", "Only one final draft is available", "The creator did not return a ranked variant list for this run, so only the selected email is currently available.")
 
-                _increment_processed_customers(approved_ids[start:end])
-                progress.progress(int(((batch_index + 1) / batch_count) * 100))
-            else:
-                status_box.success(f"All {batch_count} batches scheduled")
-                st.session_state.update(
-                    {
-                        "campaign_executed": True,
-                        "campaign_ids": campaign_ids,
-                        "campaign_id": campaign_ids[-1] if campaign_ids else None,
-                        "agent_logs": "\n".join(logs),
-                        "executed_send_time": approved_send_time,
-                        "step": "executed",
-                    }
-                )
-                st.session_state["execution_in_progress"] = False
-                st.rerun()
-        except Exception as exc:
-            st.session_state["execution_in_progress"] = False
-            error_details = str(exc).strip() or repr(exc)
-            render_alert(
-                "error",
-                "Campaign execution stopped",
-                f"The send process hit an issue before completion. {error_details}",
-                error_details,
+    with audience_tab:
+        render_panel_intro(
+            "Audience approval",
+            "This tab is the approval surface before launch. Review the matched audience, inspect any fallback notes, and trigger execution only when the list looks right.",
+            eyebrow="Human approval",
+        )
+        approval_card_1, approval_card_2, approval_card_3 = st.columns(3)
+        with approval_card_1:
+            render_summary_card("Matched customers", str(len(approved_ids)), "current approved audience", tone="blue")
+        with approval_card_2:
+            render_summary_card("Batches", str(batch_count), "campaigns scheduled in groups of 200", tone="amber")
+        with approval_card_3:
+            render_summary_card("Approval state", approval_state, "audience validation result", tone="violet")
+
+        if schema_fallback_used:
+            unsupported = approval_meta.get("unsupported_segments") or []
+            notes = approval_meta.get("matching_notes") or []
+            message = "Requested marketing segments could not be proven from the current cohort fields, so the full cohort was used to keep testing unblocked."
+            if unsupported:
+                message += f" Unsupported segments: {', '.join(unsupported)}."
+            render_alert("warning", "Schema-aware fallback used", message, "\n".join(notes) if notes else None)
+        elif approval_meta.get("matching_notes"):
+            render_panel_intro("Audience matching notes", "These notes explain how the current audience was mapped from the cohort data.", eyebrow="Matching logic")
+            st.markdown(
+                _list_to_html([str(item) for item in approval_meta.get("matching_notes", []) or []], "No matching notes were recorded."),
+                unsafe_allow_html=True,
             )
 
-    if reject_col.button("Reject", disabled=execution_in_progress):
-        render_alert("warning", "Campaign rejected", "The current draft has been cleared so you can start again with a new brief.")
-        for key in [
-            "plan",
-            "content",
-            "step",
-            "approved_customer_ids",
-            "approved_customers",
-            "approval_match_meta",
-        ]:
-            st.session_state.pop(key, None)
-        _clear_execution_state()
-        st.rerun()
+        if approved_customers:
+            rows = [
+                {
+                    "customer_id": customer.get("customer_id") or customer.get("id") or customer.get("customerId"),
+                    "name": customer.get("Full_Name") or customer.get("Full_name") or customer.get("full_name") or customer.get("fullName") or customer.get("name") or customer.get("email") or "-",
+                    "city": customer.get("City") or customer.get("city") or "-",
+                    "occupation": customer.get("Occupation") or customer.get("occupation") or customer.get("Occupation type") or customer.get("occupation_type") or "-",
+                    "social_media_active": customer.get("Social_Media_Active") or "-",
+                    "kyc_status": customer.get("KYC status") or customer.get("kyc_status") or customer.get("KYC_status") or "-",
+                }
+                for customer in approved_customers
+            ]
+            render_panel_intro(
+                "Audience preview",
+                "Use this cleaner preview to confirm the matched cohort quickly during demos and reviews. The full structured list is still available if you need to inspect every row.",
+                eyebrow="Matched customers",
+            )
+            render_customer_preview(rows)
+            with st.expander("Open raw audience table", expanded=False):
+                st.dataframe(rows, width="stretch", hide_index=True)
+        elif approved_ids:
+            render_alert("info", "ID-only audience loaded", f"{len(approved_ids)} matched customers were returned without full profile details.")
+        else:
+            render_alert("info", "No matched customers yet", "The current segment rules did not match any customers in the fetched cohort.")
+
+        approve_col, reject_col, _ = st.columns([1, 1, 3])
+        execution_in_progress = st.session_state.get("execution_in_progress", False)
+
+        if approve_col.button("Approve and execute", type="primary", disabled=not bool(approved_ids) or execution_in_progress):
+            st.session_state["execution_in_progress"] = True
+            status_box = st.empty()
+            progress = st.progress(0)
+            total = len(approved_ids)
+            batch_size = 200
+            approved_send_time = _approval_send_time()
+            campaign_ids, logs = [], []
+
+            try:
+                for batch_index in range(batch_count):
+                    start = batch_index * batch_size
+                    end = min((batch_index + 1) * batch_size, total)
+                    status_box.info(f"Scheduling batch {batch_index + 1} of {batch_count}")
+                    with st.spinner(f"Batch {batch_index + 1} is being scheduled"):
+                        preview = execute_campaign(
+                            content,
+                            audience_segments,
+                            send_time=approved_send_time,
+                            customer_ids=approved_ids[start:end],
+                            approved=False,
+                        )
+                        result = execute_campaign(
+                            content,
+                            audience_segments,
+                            send_time=approved_send_time,
+                            customer_ids=approved_ids[start:end],
+                            approved=True,
+                            approved_proposal=preview.get("validated_proposal"),
+                        )
+
+                    if not result.get("success"):
+                        st.session_state["execution_in_progress"] = False
+                        render_alert(
+                            "error",
+                            f"Batch {batch_index + 1} could not be scheduled",
+                            "The campaign stopped before all batches were queued.",
+                            str(result.get("logs")),
+                        )
+                        break
+
+                    if result.get("campaign_id"):
+                        campaign_ids.append(result["campaign_id"])
+                    if result.get("logs"):
+                        logs.append(f"Batch {batch_index + 1}: {result['logs']}")
+
+                    _increment_processed_customers(approved_ids[start:end])
+                    progress.progress(int(((batch_index + 1) / max(batch_count, 1)) * 100))
+                else:
+                    status_box.success(f"All {batch_count} batches scheduled")
+                    st.session_state.update(
+                        {
+                            "campaign_executed": True,
+                            "campaign_ids": campaign_ids,
+                            "campaign_id": campaign_ids[-1] if campaign_ids else None,
+                            "agent_logs": "\n".join(logs),
+                            "executed_send_time": approved_send_time,
+                            "step": "executed",
+                        }
+                    )
+                    st.session_state["execution_in_progress"] = False
+                    st.rerun()
+            except Exception as exc:
+                st.session_state["execution_in_progress"] = False
+                error_details = str(exc).strip() or repr(exc)
+                render_alert(
+                    "error",
+                    "Campaign execution stopped",
+                    f"The send process hit an issue before completion. {error_details}",
+                    error_details,
+                )
+
+        if reject_col.button("Reject", disabled=execution_in_progress):
+            render_alert("warning", "Campaign rejected", "The current draft has been cleared so you can start again with a new brief.")
+            for key in [
+                "plan",
+                "content",
+                "step",
+                "approved_customer_ids",
+                "approved_customers",
+                "approval_match_meta",
+            ]:
+                st.session_state.pop(key, None)
+            _clear_execution_state()
+            st.rerun()
 
 if st.session_state.get("campaign_executed"):
     render_section_heading(
@@ -815,7 +1159,27 @@ if st.session_state.get("campaign_executed"):
 
     campaign_ids = st.session_state.get("campaign_ids", [])
     if campaign_ids:
-        st.caption("Campaign IDs: " + "  ·  ".join(campaign_ids))
+        st.caption("Campaign IDs: " + "  -  ".join(campaign_ids))
+
+    render_spotlight_panel(
+        "Performance command deck",
+        "Use this layer to compare the launched baseline against optimized relaunches without losing the context of which mail is live and which segment experiments have already run.",
+        [
+            ("Campaign batches", str(len(campaign_ids) or 1)),
+            ("Executed send", str(st.session_state.get("executed_send_time", "-"))),
+            ("Optimizer state", "Ready" if st.session_state.get("optimized_data") else "Awaiting metrics"),
+            ("Processed customers", str(st.session_state.get("processed_customers", 0))),
+        ],
+        eyebrow="Optimization",
+    )
+
+    if "content" not in st.session_state:
+        render_alert(
+            "error",
+            "Campaign content is missing from session",
+            "The optimization workspace needs the original approved content, but it was not found in the current session. Regenerate and relaunch the campaign before optimizing again.",
+        )
+        st.stop()
 
     optimizer_in_progress = st.session_state.get("optimizer_in_progress", False)
     if st.button("Fetch metrics and run optimizer", disabled=optimizer_in_progress):
@@ -842,257 +1206,438 @@ if st.session_state.get("campaign_executed"):
     if "optimized_data" in st.session_state:
         optimized_data = st.session_state["optimized_data"]
         metrics = optimized_data.get("metrics", {})
-        performance_score = optimized_data.get("performance_score", 0)
-        recipient_count = metrics.get("recipient_count", 0)
-        campaign_count = metrics.get("campaign_count", 1)
-        open_rate = float(metrics.get("open_rate", 0) or 0)
-        click_rate = float(metrics.get("click_rate", 0) or 0)
+        performance_score = _safe_float(optimized_data.get("performance_score", 0) or 0)
+        recipient_count = _safe_int(metrics.get("recipient_count", 0) or 0)
+        campaign_count = _safe_int(metrics.get("campaign_count", 1) or 1, default=1)
+        open_rate = _safe_float(metrics.get("open_rate", 0) or 0)
+        click_rate = _safe_float(metrics.get("click_rate", 0) or 0)
+        current_mail = st.session_state.get("content", {}) or {}
+        segments = optimized_data.get("optimized_content", {}).get("micro_segments", []) or []
+        completed_loop_keys = sorted(key for key in st.session_state.keys() if key.startswith("loop_results_"))
+        loop_results_map = {int(key.split("_")[-1]): st.session_state.get(key) or {} for key in completed_loop_keys}
 
-        st.markdown("**Baseline campaign performance**")
-        st.caption("Baseline metrics and micro-segment relaunch metrics are shown separately.")
+        chart_rows = [
+            {
+                "Stage": "Baseline",
+                "Open Rate": open_rate,
+                "Click Rate": click_rate,
+                "Score": performance_score,
+            }
+        ]
+        best_attempt = None
+        for loop_result in loop_results_map.values():
+            for attempt in loop_result.get("attempts", []):
+                if best_attempt is None or _safe_float(attempt.get("score", 0) or 0) > _safe_float(best_attempt.get("score", 0) or 0):
+                    best_attempt = attempt
+
+        best_open = open_rate
+        best_click = click_rate
+        best_score = performance_score
+        if best_attempt:
+            best_metrics = best_attempt.get("metrics", {})
+            best_open = _safe_float(best_metrics.get("open_rate", 0) or 0)
+            best_click = _safe_float(best_metrics.get("click_rate", 0) or 0)
+            best_score = _safe_float(best_attempt.get("score", 0) or 0)
+            chart_rows.append(
+                {
+                    "Stage": f"Best Relaunch (Attempt {best_attempt.get('attempt')})",
+                    "Open Rate": best_open,
+                    "Click Rate": best_click,
+                    "Score": best_score,
+                }
+            )
 
         render_status_chips(
             [
                 "Live Metrics Loaded",
                 f"{recipient_count or 0} Records Aggregated",
-                "Optimization Ready",
+                f"{len(segments)} Segment Plays Ready",
+                f"{len(loop_results_map)} Relaunches Captured",
             ]
         )
 
-        metric_1, metric_2, metric_3 = st.columns(3)
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
         with metric_1:
-            render_summary_card("Open Rate", f"{open_rate:.1f}%", "Baseline across original campaign batches", tone="blue")
+            render_summary_card("Baseline Open Rate", f"{open_rate:.1f}%", "original campaign batches", tone="blue")
         with metric_2:
-            render_summary_card("CTR (Primary Metric)", f"{click_rate:.1f}%", "PRIMARY METRIC - Baseline across original campaign batches", tone="violet")
+            render_summary_card("Baseline CTR", f"{click_rate:.1f}%", "primary optimization metric", tone="violet")
         with metric_3:
-            render_summary_card("Optimization Score", f"{performance_score:.2f}", "Baseline score weighted more toward clicks than opens", tone="mint")
+            render_summary_card("Best Score Seen", f"{best_score:.2f}", "highest score across baseline and relaunches", tone="mint")
+        with metric_4:
+            render_summary_card("Segments in Play", str(len(segments)), "micro-segments ready for relaunch", tone="amber")
 
-        if recipient_count:
-            st.caption(f"Based on {recipient_count} recipient records aggregated across all campaign batches. CTR is the percentage of recipients who clicked the campaign link.")
-            st.caption(f"Aggregated across {campaign_count} campaign ID(s) / batch(es).")
-        else:
-            st.caption("CTR means the percentage of recipients who clicked the campaign link. No report records were available yet, so these values may still be pending.")
+        overview_tab, mail_tab, segment_tab, logs_tab = st.tabs(
+            ["Performance overview", "Mail in play", "Segment relaunches", "Execution logs"]
+        )
 
-        if st.button("View technical details", width="content"):
-            st.session_state["show_optimizer_technical_details"] = not st.session_state.get("show_optimizer_technical_details", False)
+        with overview_tab:
+            render_panel_intro(
+                "Optimization overview",
+                "Baseline performance stays visible while relaunch improvements surface separately, so the page stays readable even as more data arrives.",
+                eyebrow="Performance",
+            )
 
-        if st.session_state.get("show_optimizer_technical_details"):
-            with st.expander("Technical details", expanded=True):
-                st.code(optimized_data.get("logs", "No technical details available."))
-                st.json(metrics)
+            overview_left, overview_right = st.columns([1.45, 1], gap="large")
+            with overview_left:
+                baseline_copy = (
+                    f"Open rate is currently {open_rate:.1f}% and click rate is {click_rate:.1f}% "
+                    f"across {campaign_count} executed batch{'es' if campaign_count != 1 else ''}."
+                )
+                render_copy_panel("Baseline narrative", baseline_copy, eyebrow="Current performance")
+                st.line_chart(chart_rows, x="Stage", y=["Open Rate", "Click Rate", "Score"], height=340)
 
-        current_mail = st.session_state.get("content", {})
-        st.markdown("**Optimization dashboard**")
-        dashboard_tab, mail_tab = st.tabs(["Improvement graph", "Mail in use"])
-
-        with dashboard_tab:
-            chart_rows = [
-                {
-                    "Stage": "Baseline",
-                    "Open Rate": open_rate,
-                    "Click Rate": click_rate,
-                    "Score": float(performance_score or 0),
-                }
-            ]
-            best_attempt = None
-            for key in [item for item in st.session_state.keys() if item.startswith("loop_results_")]:
-                loop_result = st.session_state.get(key) or {}
-                for attempt in loop_result.get("attempts", []):
-                    if best_attempt is None or float(attempt.get("score", 0) or 0) > float(best_attempt.get("score", 0) or 0):
-                        best_attempt = attempt
-
-            if best_attempt:
-                best_metrics = best_attempt.get("metrics", {})
-                chart_rows.append(
-                    {
-                        "Stage": f"Best Relaunch (Attempt {best_attempt.get('attempt')})",
-                        "Open Rate": float(best_metrics.get("open_rate", 0) or 0),
-                        "Click Rate": float(best_metrics.get("click_rate", 0) or 0),
-                        "Score": float(best_attempt.get("score", 0) or 0),
-                    }
+            with overview_right:
+                render_info_grid(
+                    [
+                        ("Recipients aggregated", f"{recipient_count:,}" if recipient_count else "Pending"),
+                        ("Campaign batches", str(campaign_count)),
+                        ("Best open rate", f"{best_open:.1f}%"),
+                        ("Best click rate", f"{best_click:.1f}%"),
+                        ("Baseline score", f"{performance_score:.2f}"),
+                        ("Best score", f"{best_score:.2f}"),
+                    ]
                 )
 
-            st.line_chart(chart_rows, x="Stage", y=["Open Rate", "Click Rate", "Score"], height=300)
-            if best_attempt:
-                best_metrics = best_attempt.get("metrics", {})
-                render_alert(
-                    "success",
-                    "Best observed improvement",
-                    (
-                        f"Best relaunch reached open rate {best_metrics.get('open_rate', 0)}%, "
-                        f"click rate {best_metrics.get('click_rate', 0)}%, "
-                        f"and score {best_attempt.get('score', 0)}."
-                    ),
-                )
-            else:
-                render_alert(
-                    "info",
-                    "Baseline only so far",
-                    "Run an autonomous optimization loop on a segment to compare baseline performance against relaunch results here.",
-                )
+                if recipient_count:
+                    render_alert(
+                        "info",
+                        "How to read this dashboard",
+                        "Baseline cards summarize the original campaign. Relaunch results below compare only the optimized segment attempts.",
+                    )
+                else:
+                    render_alert(
+                        "warning",
+                        "Metrics are still warming up",
+                        "The campaign has been executed, but no report rows are available yet. Fetch again after data lands in CampaignX.",
+                    )
+
+                if best_attempt:
+                    render_alert(
+                        "success",
+                        "Best observed improvement",
+                        f"Best relaunch reached open rate {best_open:.1f}%, click rate {best_click:.1f}%, and score {best_score:.2f}.",
+                    )
+                else:
+                    render_alert(
+                        "info",
+                        "Baseline only so far",
+                        "Run a segment relaunch to compare optimized attempts against the baseline here.",
+                    )
+
+            if st.button("View technical details", width="content"):
+                st.session_state["show_optimizer_technical_details"] = not st.session_state.get("show_optimizer_technical_details", False)
+
+            if st.session_state.get("show_optimizer_technical_details"):
+                with st.expander("Technical details", expanded=True):
+                    st.code(optimized_data.get("logs", "No technical details available."))
+                    st.json(metrics)
 
         with mail_tab:
-            mail_left, mail_right = st.columns([1.6, 1], gap="large")
+            render_panel_intro(
+                "Mail currently in play",
+                "This is the active email content the workspace used for the approved launch, with the current CTA and selection rationale visible beside it.",
+                eyebrow="Active creative",
+            )
+            mail_left, mail_right = st.columns([1.55, 1], gap="large")
             with mail_left:
-                st.markdown("**Current selected mail**")
-                st.write(f"**Subject:** {current_mail.get('subject', '-')}")
-                st.write("**Body:**")
-                st.markdown(current_mail.get("body", ""))
+                render_mail_frame(
+                    "Live campaign email",
+                    str(current_mail.get("subject", "") or "-"),
+                    str(current_mail.get("body", "") or ""),
+                    eyebrow="Current mail",
+                    note="This is the approved baseline mail that current performance metrics are tied to.",
+                )
             with mail_right:
-                render_summary_card("CTA URL", current_mail.get("url", "-") or "-", "mail currently being used in the workspace", tone="violet")
-                render_summary_card("CTA text", current_mail.get("cta_text", "-") or "-", "current action line", tone="amber")
-                render_summary_card("Selection basis", current_mail.get("selection_reason", "Top-ranked variant"), "why this mail is active", tone="mint")
+                render_info_grid(
+                    [
+                        ("CTA text", str(current_mail.get("cta_text", "-") or "-")),
+                        ("CTA URL", str(current_mail.get("url", "-") or "-")),
+                        ("Selection basis", str(current_mail.get("selection_reason", "Top-ranked variant") or "Top-ranked variant")),
+                        ("Status", "Launched"),
+                    ]
+                )
+                render_copy_panel(
+                    "Why this mail was chosen",
+                    str(current_mail.get("selection_reason", "Top-ranked variant chosen by the creator and validation pipeline.") or "Top-ranked variant chosen by the creator and validation pipeline."),
+                    eyebrow="Selection logic",
+                )
 
-        segments = optimized_data.get("optimized_content", {}).get("micro_segments", [])
-        if segments:
-            st.markdown("**Micro-segment optimization**")
-            for index, segment in enumerate(segments):
-                segment_name = segment.get("segment_name", f"Segment {index + 1}")
-                with st.expander(f"Variant {index + 1}: {segment_name}"):
-                    left, right = st.columns([3, 1])
-                    with left:
-                        st.write(f"**Reasoning:** {segment.get('reasoning', '')}")
-                        st.write(f"**Subject:** {segment.get('subject', '')}")
-                        st.write("**Body:**")
-                        st.markdown(segment.get("body", ""))
+        with segment_tab:
+            render_panel_intro(
+                "Segment relaunch studio",
+                "Each segment now lives in its own workspace so you can review the reasoning, inspect the draft, run the retry loop, and study outcomes without piling everything into one long page.",
+                eyebrow="Relaunches",
+            )
+            if segments:
+                segment_tabs = st.tabs([segment.get("segment_name", f"Segment {index + 1}") for index, segment in enumerate(segments)])
 
-                    with right:
-                        raw_time = segment.get("send_time", "")
-                        st.write("**Send time**")
-                        st.markdown(f"`{raw_time}`")
+                for index, (segment, segment_view) in enumerate(zip(segments, segment_tabs)):
+                    with segment_view:
+                        segment_name = segment.get("segment_name", f"Segment {index + 1}")
+                        loop_result = loop_results_map.get(index)
+                        segment_running = st.session_state.get("segment_loop_running")
+                        send_time = _format_send_time(str(segment.get("send_time", "") or ""))
+                        attempts = loop_result.get("attempts", []) if isinstance(loop_result, dict) else []
 
-                        segment_loop_running = st.session_state.get("segment_loop_running")
+                        segment_left, segment_right = st.columns([1.55, 1], gap="large")
+                        with segment_left:
+                            render_copy_panel(
+                                "Optimization rationale",
+                                str(segment.get("reasoning", "") or "No optimizer rationale was generated for this segment."),
+                                eyebrow=segment_name,
+                            )
+                            render_mail_frame(
+                                "Proposed segment email",
+                                str(segment.get("subject", "") or "-"),
+                                str(segment.get("body", "") or ""),
+                                eyebrow="Segment creative",
+                                note=f"Suggested send time: {send_time}",
+                            )
 
-                        if st.button("Run autonomous optimization", key=f"exec_{index}", width="stretch", disabled=bool(segment_loop_running)):
-                            st.session_state["segment_loop_running"] = index
-                            loop_key = f"loop_results_{index}"
-                            with st.status(f"Optimizing {segment_name}", expanded=True) as loop_status:
-                                try:
-                                    cohort = fetch_customer_cohort_fresh()
-                                    filtered = filter_customer_cohort(cohort, [segment_name], brief=st.session_state.get("brief", ""))
-                                    variant_ids = filtered.get("customer_ids") or []
+                        with segment_right:
+                            render_info_grid(
+                                [
+                                    ("Suggested send time", send_time),
+                                    ("Loop status", "Complete" if loop_result else "Ready"),
+                                    ("Attempts captured", str(len(attempts))),
+                                    ("Segment name", segment_name),
+                                ]
+                            )
 
-                                    if not variant_ids:
-                                        loop_status.update(label="No matched customers for this segment", state="error")
-                                        render_alert("warning", "Segment has no matched customers", f"No customers were found for {segment_name}.")
+                            if st.button(
+                                "Run autonomous optimization",
+                                key=f"exec_{index}",
+                                width="stretch",
+                                disabled=segment_running is not None,
+                            ):
+                                st.session_state["segment_loop_running"] = index
+                                loop_key = f"loop_results_{index}"
+                                with st.status(f"Optimizing {segment_name}", expanded=True) as loop_status:
+                                    try:
+                                        cohort = fetch_customer_cohort_fresh()
+                                        filtered = filter_customer_cohort(
+                                            cohort,
+                                            [segment_name],
+                                            brief=st.session_state.get("brief", ""),
+                                        )
+                                        variant_ids = filtered.get("customer_ids") or []
+
+                                        if not variant_ids:
+                                            loop_status.update(label="No matched customers for this segment", state="error")
+                                            render_alert(
+                                                "warning",
+                                                "Segment has no matched customers",
+                                                f"No customers were found for {segment_name}.",
+                                            )
+                                            st.session_state["segment_loop_running"] = None
+                                        else:
+                                            loop_history: list[dict] = []
+
+                                            def visual_callback(data: dict, critique: str = "") -> None:
+                                                attempt_number = _safe_int(data.get("attempt"), default=len(loop_history) + 1)
+                                                loop_metrics = data.get("metrics", {}) or {}
+                                                loop_score = _safe_float(data.get("score", 0) or 0)
+
+                                                open_delta = None
+                                                click_delta = None
+                                                score_delta = None
+                                                if loop_history:
+                                                    previous = loop_history[-1]
+                                                    previous_metrics = previous.get("metrics", {}) or {}
+                                                    open_delta = _safe_float(loop_metrics.get("open_rate", 0)) - _safe_float(previous_metrics.get("open_rate", 0))
+                                                    click_delta = _safe_float(loop_metrics.get("click_rate", 0)) - _safe_float(previous_metrics.get("click_rate", 0))
+                                                    score_delta = loop_score - _safe_float(previous.get("score", 0))
+
+                                                st.markdown("#### Micro-segment relaunch metrics")
+                                                st.caption(f"{segment_name} - attempt {attempt_number}")
+                                                progress_col_1, progress_col_2, progress_col_3 = st.columns(3)
+                                                progress_col_1.metric(
+                                                    "Open rate",
+                                                    f"{_safe_float(loop_metrics.get('open_rate', 0)):.1f}%",
+                                                    delta=f"{open_delta:+.2f}%" if open_delta is not None else None,
+                                                )
+                                                progress_col_2.metric(
+                                                    "Click rate",
+                                                    f"{_safe_float(loop_metrics.get('click_rate', 0)):.1f}%",
+                                                    delta=f"{click_delta:+.2f}%" if click_delta is not None else None,
+                                                )
+                                                progress_col_3.metric(
+                                                    "Score",
+                                                    f"{loop_score:.2f}",
+                                                    delta=f"{score_delta:+.2f}" if score_delta is not None else None,
+                                                )
+                                                attempt_recipient_count = loop_metrics.get(
+                                                    "recipient_count",
+                                                    loop_metrics.get("total_rows", 0),
+                                                )
+                                                if attempt_recipient_count:
+                                                    st.caption(
+                                                        f"Campaign `{data.get('campaign_id', '-')}` - {attempt_recipient_count} report rows captured for this attempt"
+                                                    )
+
+                                                if critique:
+                                                    render_alert("info", "AI insight", critique)
+                                                elif data.get("target_reached"):
+                                                    render_alert("success", "Target reached", "Optimization goals were met for this segment.")
+
+                                                st.divider()
+                                                loop_history.append(data)
+
+                                            results = run_optimization_loop(
+                                                content=segment,
+                                                audience=[segment_name],
+                                                customer_ids=variant_ids,
+                                                send_time=segment.get("send_time"),
+                                                on_attempt=visual_callback,
+                                            )
+
+                                            _increment_processed_customers(variant_ids)
+                                            st.session_state[loop_key] = results
+                                            st.session_state["segment_loop_running"] = None
+
+                                            if results.get("target_reached"):
+                                                loop_status.update(label="Optimization loops complete", state="complete", expanded=False)
+                                                render_alert(
+                                                    "success",
+                                                    "Optimization complete",
+                                                    f"{segment_name} completed all 3 loops and reached the defined target during the run.",
+                                                )
+                                            else:
+                                                loop_status.update(label="Optimization cycle finished", state="complete", expanded=True)
+                                                render_alert(
+                                                    "info",
+                                                    "Optimization cycle finished",
+                                                    f"All 3 loops completed for {segment_name} before the full target was reached.",
+                                                )
+
+                                            st.rerun()
+                                    except Exception as exc:
                                         st.session_state["segment_loop_running"] = None
-                                        continue
+                                        loop_status.update(label="Optimization error", state="error")
+                                        render_alert(
+                                            "error",
+                                            "Autonomous optimization stopped",
+                                            "The retry loop did not finish successfully for this segment.",
+                                            str(exc),
+                                        )
 
-                                    loop_history: list[dict] = []
-
-                                    def visual_callback(data: dict, critique: str = "") -> None:
-                                        attempt_number = data["attempt"]
-                                        loop_metrics = data["metrics"]
-                                        loop_score = data["score"]
-
-                                        open_delta = None
-                                        click_delta = None
-                                        score_delta = None
-                                        if loop_history:
-                                            previous = loop_history[-1]
-                                            open_delta = loop_metrics["open_rate"] - previous["metrics"]["open_rate"]
-                                            click_delta = loop_metrics["click_rate"] - previous["metrics"]["click_rate"]
-                                            score_delta = loop_score - previous["score"]
-
-                                        st.markdown("#### Micro-segment relaunch metrics")
-                                        st.caption(f"{segment_name} - attempt {attempt_number}")
-                                        progress_col_1, progress_col_2, progress_col_3 = st.columns(3)
-                                        progress_col_1.metric("Open rate", f"{loop_metrics['open_rate']}%", delta=f"{open_delta:+.2f}%" if open_delta is not None else None)
-                                        progress_col_2.metric("Click rate", f"{loop_metrics['click_rate']}%", delta=f"{click_delta:+.2f}%" if click_delta is not None else None)
-                                        progress_col_3.metric("Score", f"{loop_score:.2f}", delta=f"{score_delta:+.2f}" if score_delta is not None else None)
-                                        recipient_count = loop_metrics.get("recipient_count", loop_metrics.get("total_rows", 0))
-                                        if recipient_count:
-                                            st.caption(f"Campaign `{data.get('campaign_id')}` - {recipient_count} report rows captured for this attempt")
-
-                                        if critique:
-                                            render_alert("info", "AI insight", critique)
-                                        elif data.get("target_reached"):
-                                            render_alert("success", "Target reached", "Optimization goals were met for this segment.")
-
-                                        st.divider()
-                                        loop_history.append(data)
-
-                                    results = run_optimization_loop(
-                                        content=segment,
-                                        audience=[segment_name],
-                                        customer_ids=variant_ids,
-                                        send_time=segment.get("send_time"),
-                                        on_attempt=visual_callback,
+                            if loop_result:
+                                last_attempt = attempts[-1] if attempts else {}
+                                last_metrics = last_attempt.get("metrics", {}) if isinstance(last_attempt, dict) else {}
+                                result_col_1, result_col_2, result_col_3 = st.columns(3)
+                                with result_col_1:
+                                    render_summary_card(
+                                        "Latest Open Rate",
+                                        f"{_safe_float(last_metrics.get('open_rate', 0) or 0):.1f}%",
+                                        "most recent relaunch attempt",
+                                        tone="blue",
+                                    )
+                                with result_col_2:
+                                    render_summary_card(
+                                        "Latest Click Rate",
+                                        f"{_safe_float(last_metrics.get('click_rate', 0) or 0):.1f}%",
+                                        "latest click performance",
+                                        tone="violet",
+                                    )
+                                with result_col_3:
+                                    render_summary_card(
+                                        "Latest Score",
+                                        f"{_safe_float(last_attempt.get('score', 0) or 0):.2f}",
+                                        "latest optimization score",
+                                        tone="mint",
                                     )
 
-                                    _increment_processed_customers(variant_ids)
-                                    st.session_state[loop_key] = results
-                                    st.session_state["segment_loop_running"] = None
-
-                                    if results.get("target_reached"):
-                                        loop_status.update(label="Optimization loops complete", state="complete", expanded=False)
-                                        render_alert("success", "Optimization complete", f"{segment_name} completed all 3 loops and reached the defined target during the run.")
-                                    else:
-                                        loop_status.update(label="Optimization cycle finished", state="complete", expanded=True)
-                                        render_alert("info", "Optimization cycle finished", f"All 3 loops completed for {segment_name} before the full target was reached.")
-
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.session_state["segment_loop_running"] = None
-                                    loop_status.update(label="Optimization error", state="error")
-                                    render_alert(
-                                        "error",
-                                        "Autonomous optimization stopped",
-                                        "The retry loop did not finish successfully for this segment.",
-                                        str(exc),
-                                    )
-
-                        loop_result = st.session_state.get(f"loop_results_{index}")
-                        if loop_result:
-                            with st.expander(f"View optimization logs for {segment_name}", expanded=False):
-                                st.markdown("### Micro-segment relaunch metrics")
-                                attempt_chart_rows = []
-                                for attempt in loop_result.get("attempts", []):
-                                    st.markdown(f"**Attempt {attempt['attempt']}**")
-                                    st.write(f"- Campaign ID: `{attempt.get('campaign_id')}`")
-                                    attempt_metrics = attempt.get("metrics", {})
-                                    st.write(f"- Open Rate: {attempt_metrics.get('open_rate')}% | Click Rate: {attempt_metrics.get('click_rate')}%")
-                                    st.write(f"- Report rows: `{attempt_metrics.get('recipient_count', attempt_metrics.get('total_rows', 0))}`")
-                                    st.write(f"- Performance Score: `{attempt.get('score')}`")
-                                    attempt_chart_rows.append(
-                                        {
-                                            "Attempt": f"Attempt {attempt['attempt']}",
-                                            "Open Rate": float(attempt_metrics.get("open_rate", 0) or 0),
-                                            "Click Rate": float(attempt_metrics.get("click_rate", 0) or 0),
-                                            "Score": float(attempt.get("score", 0) or 0),
-                                        }
-                                    )
-                                    st.divider()
-
+                                attempt_chart_rows = [
+                                    {
+                                        "Attempt": f"Attempt {attempt['attempt']}",
+                                        "Open Rate": _safe_float(attempt.get("metrics", {}).get("open_rate", 0) or 0),
+                                        "Click Rate": _safe_float(attempt.get("metrics", {}).get("click_rate", 0) or 0),
+                                        "Score": _safe_float(attempt.get("score", 0) or 0),
+                                    }
+                                    for attempt in attempts
+                                ]
                                 if attempt_chart_rows:
-                                    st.markdown("### Performance trend")
                                     st.line_chart(
                                         attempt_chart_rows,
                                         x="Attempt",
                                         y=["Open Rate", "Click Rate", "Score"],
-                                        height=260,
+                                        height=280,
                                     )
 
-                                if loop_result.get("target_reached"):
-                                    render_alert("success", "Target reached during loop", "All 3 loops ran, and at least one optimized payload reached the defined performance threshold.")
-                                else:
-                                    render_alert("warning", "Target not fully met", "All 3 loops ran, but the target was not fully satisfied.")
+                                attempt_summaries = []
+                                for attempt in attempts:
+                                    attempt_metrics = attempt.get("metrics", {}) or {}
+                                    rows = [
+                                        f"Campaign ID: {attempt.get('campaign_id', '-')}",
+                                        f"Open Rate: {attempt_metrics.get('open_rate', 0)}%",
+                                        f"Click Rate: {attempt_metrics.get('click_rate', 0)}%",
+                                        f"Report Rows: {attempt_metrics.get('recipient_count', attempt_metrics.get('total_rows', 0))}",
+                                        f"Performance Score: {attempt.get('score', 0)}",
+                                    ]
+                                    attempt_summaries.append("\n".join(rows))
 
-                                final_payload = loop_result.get("final_content") or segment
-                                html_data = wrap_as_html(final_payload)
-                                st.download_button(
-                                    label=f"Download optimized {segment_name} HTML",
-                                    data=html_data,
-                                    file_name=f"optimized_{segment_name.lower().replace(' ', '_')}.html",
-                                    mime="text/html",
-                                    width="stretch",
+                                detail_left, detail_right = st.columns([1.2, 1], gap="large")
+                                with detail_left:
+                                    render_copy_panel(
+                                        "Attempt summaries",
+                                        "\n\n".join(attempt_summaries),
+                                        eyebrow="Loop history",
+                                    )
+                                with detail_right:
+                                    if loop_result.get("target_reached"):
+                                        render_alert(
+                                            "success",
+                                            "Target reached during loop",
+                                            "At least one optimized payload reached the defined performance threshold during the run.",
+                                        )
+                                    else:
+                                        render_alert(
+                                            "warning",
+                                            "Target not fully met",
+                                            "The retry loop completed, but the defined performance threshold was not fully met.",
+                                        )
+
+                                    final_payload = loop_result.get("final_content") or segment
+                                    html_data = wrap_as_html(final_payload)
+                                    st.download_button(
+                                        label=f"Download optimized {segment_name} HTML",
+                                        data=html_data,
+                                        file_name=f"optimized_{segment_name.lower().replace(' ', '_')}.html",
+                                        mime="text/html",
+                                        width="stretch",
+                                    )
+                            else:
+                                render_alert(
+                                    "info",
+                                    "Segment ready for optimization",
+                                    "Review the draft and run the autonomous optimization loop when you want relaunch results for this segment.",
                                 )
+            else:
+                render_alert(
+                    "info",
+                    "No micro-segments available yet",
+                    "The optimizer did not return any segment-specific relaunch ideas for this campaign.",
+                )
 
-        with st.expander("Execution logs"):
-            st.text_area(
-                "Agent logs",
-                st.session_state.get("agent_logs", "No logs."),
-                height=180,
-                label_visibility="collapsed",
+        with logs_tab:
+            render_panel_intro(
+                "Execution and optimizer logs",
+                "Keep raw traces tucked away here so the main experience stays clean while technical details remain available when you need them.",
+                eyebrow="Diagnostics",
             )
+            log_col_1, log_col_2 = st.columns([1.2, 1], gap="large")
+            with log_col_1:
+                st.text_area(
+                    "Agent logs",
+                    st.session_state.get("agent_logs", "No logs."),
+                    height=260,
+                )
+            with log_col_2:
+                st.text_area(
+                    "Optimizer logs",
+                    str(optimized_data.get("logs", "No optimizer logs available.")),
+                    height=260,
+                )
+                st.json(metrics)
+
 

@@ -5,6 +5,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 
 from utils.ollama_client import ollama_chat
+from utils.settings import get_engagement_windows
 
 
 class CampaignPlan(BaseModel):
@@ -12,14 +13,6 @@ class CampaignPlan(BaseModel):
     target_audience: list[str] = Field(description="List of target audience descriptors/segments")
     send_time: str = Field(description="Recommended engagement-optimized send time in DD:MM:YY HH:MM:SS format")
     goals: list[str] = Field(description="List of campaign goals with click-through rate prioritized while maintaining strong open rate")
-
-
-ENGAGEMENT_WINDOWS = [
-    (9, 0, "Morning engagement window"),
-    (13, 0, "Lunch-break engagement window"),
-    (18, 30, "Evening engagement window"),
-]
-
 
 def _brief_requires_full_cohort(brief: str) -> bool:
     if not brief:
@@ -52,7 +45,7 @@ def _brief_mentions_female_senior_citizens(brief: str) -> bool:
 def _next_send_window(now: datetime | None = None) -> tuple[str, str]:
     now = now or datetime.now()
     candidates = []
-    for hour, minute, label in ENGAGEMENT_WINDOWS:
+    for hour, minute, label in get_engagement_windows():
         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= now + timedelta(minutes=10):
             candidate += timedelta(days=1)
