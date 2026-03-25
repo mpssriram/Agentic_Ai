@@ -145,6 +145,18 @@ def get_cohort_fallback_path() -> str:
     return str(path if path.is_absolute() else (REPO_ROOT / path))
 
 
+def get_allow_local_cohort_fallback_enabled() -> bool:
+    return _parse_bool_env("CAMPAIGNX_ALLOW_LOCAL_COHORT_FALLBACK", False)
+
+
+def get_optimizer_auto_approve_sends_enabled() -> bool:
+    return _parse_bool_env("CAMPAIGNX_OPTIMIZER_AUTO_APPROVE_SENDS", False)
+
+
+def get_executor_debug_enabled() -> bool:
+    return _parse_bool_env("CAMPAIGNX_DEBUG_EXECUTION", False)
+
+
 def get_engagement_windows() -> list[tuple[int, int, str]]:
     parsed = _parse_json_env("CAMPAIGNX_ENGAGEMENT_WINDOWS")
     if not isinstance(parsed, list):

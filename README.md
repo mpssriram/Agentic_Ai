@@ -22,11 +22,11 @@ The app is designed as a practical hackathon MVP: readable, demo-friendly, and c
 
 - Multi-agent workflow with separate planner, creator, executor, and optimizer stages
 - Streamlit dashboard for brief intake, review, approval, execution, and optimization
-- Dynamic API operation planning from the supplied OpenAPI spec
+- Spec-validated send and report execution grounded in the supplied OpenAPI spec
 - Human-in-the-loop approval before campaign execution
 - Live cohort fetching and audience filtering
 - Baseline performance analysis using `EO` and `EC` report fields
-- Optimization loop that can rewrite and relaunch segment-specific variants
+- Optimization loop that can rewrite segment-specific variants, with autonomous relaunches gated behind explicit config
 - Local LLM support via Ollama
 - Validation and scoring helpers for copy quality and compliance
 
@@ -83,10 +83,10 @@ File: `agents/creator.py`
 File: `agents/executor.py`
 
 - Reads the OpenAPI spec from `data/superbfsi_api_spec.yaml`
-- Plans valid API calls for:
-  - customer cohort retrieval
+- Plans and validates API calls for:
   - campaign sending
   - report fetching
+- Fetches the live customer cohort directly from the CampaignX cohort endpoint, with local fixture fallback only when explicitly enabled for demo/offline runs
 - Validates payloads against hackathon policy constraints
 - Executes approved API requests with the CampaignX API key
 - Supports batching and filtered audience execution
@@ -123,21 +123,38 @@ File: `agents/optimizer.py`
 ```text
 Agentic_Ai/
 |-- agents/
+|   |-- audience_matching.py
+|   |-- campaign_sender.py
+|   |-- cohort_service.py
 |   |-- creator.py
 |   |-- executor.py
 |   |-- optimizer.py
-|   `-- planner.py
+|   |-- planner.py
+|   `-- spec_planning.py
+|-- models/
+|   `-- shared.py
 |-- assets/
 |   `-- style.css
 |-- data/
 |   |-- customer_cohort.json
 |   `-- superbfsi_api_spec.yaml
 |-- tests/
-|   `-- test_ollama.py
+|   |-- test_agents.py
+|   |-- test_content_helpers.py
+|   |-- test_executor.py
+|   |-- test_ollama.py
+|   |-- test_optimizer.py
+|   `-- test_ui_helpers.py
+|-- ui/
+|   |-- components.py
+|   |-- optimizer_flow.py
+|   `-- review_flow.py
 |-- utils/
 |   |-- __init__.py
 |   |-- ollama_client.py
 |   |-- scorer.py
+|   |-- settings.py
+|   |-- text.py
 |   `-- validator.py
 |-- app.py
 |-- requirements.txt
@@ -183,7 +200,10 @@ Copy `.env.example` to `.env` and update the values:
 OLLAMA_MODEL=llama3.1:8b
 CAMPAIGNX_API_KEY=your_campaignx_api_key_here
 CAMPAIGNX_DEBUG_LLM=false
+CAMPAIGNX_DEBUG_EXECUTION=false
 CAMPAIGNX_CTA_MODE=raw_url
+CAMPAIGNX_ALLOW_LOCAL_COHORT_FALLBACK=false
+CAMPAIGNX_OPTIMIZER_AUTO_APPROVE_SENDS=false
 ```
 
 Required variables:
@@ -194,7 +214,10 @@ Required variables:
 Optional variables:
 
 - `CAMPAIGNX_DEBUG_LLM`: enables verbose Ollama client logging
+- `CAMPAIGNX_DEBUG_EXECUTION`: enables redacted executor HTTP/debug logging
 - `CAMPAIGNX_CTA_MODE`: controls CTA rendering in email bodies (`raw_url`, `labeled_plain`, or `html_anchor`)
+- `CAMPAIGNX_ALLOW_LOCAL_COHORT_FALLBACK`: allows `data/customer_cohort.json` fallback only for explicit demo/offline runs
+- `CAMPAIGNX_OPTIMIZER_AUTO_APPROVE_SENDS`: allows optimizer relaunch sends without per-retry human approval; default should remain `false`
 
 ### 5. Start Ollama
 
@@ -239,14 +262,13 @@ Include the call to action: https://superbfsi.com/xdeposit/explore/
 
 ## Dynamic API Discovery
 
-One of the important parts of this project is that API interaction is not treated as a fixed hardcoded flow only. The executor and optimizer use the supplied OpenAPI spec to:
+One of the important parts of this project is that send and report execution are validated against the supplied OpenAPI spec. The executor and optimizer use the spec to:
 
-- inspect available operations
-- plan request structure
+- build the allowed send/report proposal shape
 - validate method and path choices
 - enforce required payload and query keys
 
-This keeps the implementation aligned with the hackathon requirement around API-doc-driven agent behavior.
+Customer cohort fetch is currently a direct endpoint call rather than a spec-planned operation.
 
 ## Metrics and Optimization Logic
 
@@ -278,7 +300,7 @@ py -3 -m compileall agents app.py utils
 And:
 
 ```bash
-py -3 -m unittest tests.test_ollama tests.test_content_helpers
+py -3 -m unittest tests.test_executor tests.test_optimizer tests.test_agents tests.test_content_helpers tests.test_ollama
 ```
 
 This test suite uses the Python standard library `unittest`, so no extra test dependency is required.

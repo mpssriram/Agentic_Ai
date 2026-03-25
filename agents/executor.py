@@ -15,8 +15,15 @@ from langchain_community.utilities.requests import RequestsWrapper
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
 from langchain_core.outputs import ChatResult, ChatGeneration
+from models.shared import ApiProposalModel, CampaignExecutionResultModel, SendTimeResolutionModel
 from utils.ollama_client import ollama_chat
-from utils.settings import get_cohort_fallback_path, get_hackathon_policy, get_spec_path
+from utils.settings import (
+    get_allow_local_cohort_fallback_enabled,
+    get_cohort_fallback_path,
+    get_executor_debug_enabled,
+    get_hackathon_policy,
+    get_spec_path,
+)
 from utils.text import extract_urls
 
 # Paths resolved relative to this file so they work from any cwd
@@ -158,6 +165,15 @@ def _normalize_path(path: str | None) -> str:
         parsed = requests.utils.urlparse(value)
         return parsed.path or value
     return value
+
+
+def _normalize_allowed_urls(values: list[str] | None) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned = [str(item).strip() for item in values if str(item).strip()]
+    return list(dict.fromkeys(cleaned))
+
+
 def _allowed_urls_from_content(content: dict | None) -> list[str]:
     if not isinstance(content, dict):
         return []
@@ -447,6 +463,8 @@ def validate_api_call_proposal(
     if not isinstance(payload, dict):
         raise ValueError("API proposal payload must be a dict.")
 
+    effective_allowed_urls = _normalize_allowed_urls(allowed_urls)
+
     allowed_ops = (
         HACKATHON_POLICY["allowed_execution_operations"]
         if action == "send_campaign"
@@ -475,26 +493,27 @@ def validate_api_call_proposal(
         body = str(payload.get("body", ""))
         urls = extract_urls(body)
 
-        allowed_urls = []
+        derived_allowed_urls: list[str] = []
         proposal_allowed_url = proposal.get("allowed_url")
         if isinstance(proposal_allowed_url, str) and proposal_allowed_url.strip():
-            allowed_urls.append(proposal_allowed_url.strip())
+            derived_allowed_urls.append(proposal_allowed_url.strip())
 
         proposal_allowed_urls = proposal.get("allowed_urls") or []
         if isinstance(proposal_allowed_urls, list):
-            allowed_urls.extend(str(item).strip() for item in proposal_allowed_urls if str(item).strip())
+            derived_allowed_urls.extend(str(item).strip() for item in proposal_allowed_urls if str(item).strip())
 
         payload_allowed_url = payload.get("allowed_url")
         if isinstance(payload_allowed_url, str) and payload_allowed_url.strip():
-            allowed_urls.append(payload_allowed_url.strip())
+            derived_allowed_urls.append(payload_allowed_url.strip())
 
         payload_allowed_urls = payload.get("allowed_urls") or []
         if isinstance(payload_allowed_urls, list):
-            allowed_urls.extend(str(item).strip() for item in payload_allowed_urls if str(item).strip())
+            derived_allowed_urls.extend(str(item).strip() for item in payload_allowed_urls if str(item).strip())
 
-        allowed_urls = list(dict.fromkeys(allowed_urls))
+        if not effective_allowed_urls:
+            effective_allowed_urls = list(dict.fromkeys(derived_allowed_urls))
 
-        if allowed_urls and any(url not in allowed_urls for url in urls):
+        if effective_allowed_urls and any(url not in effective_allowed_urls for url in urls):
             raise ValueError("Body contains a non-approved URL.")
         if not _body_is_english_with_emoji_only(body):
             raise ValueError("Body must contain only English text, emoji, and approved URLs only.")
@@ -516,16 +535,48 @@ def validate_api_call_proposal(
         if not str(payload.get("campaign_id", "")).strip():
             raise ValueError("campaign_id is required for report fetching.")
 
-    return {
-        "operation_name": matched_name,
-        "operation_id": proposal.get("operation_id") or operation_schema.get("operationId") or matched_name,
-        "method": method,
-        "path": path,
-        "payload": payload,
-        "summary": str(proposal.get("summary", "")).strip() or str(operation_schema.get("summary", "")).strip(),
-        "requires_approval": True,
-        "logs": str(proposal.get("logs", "")).strip(),
-    }
+    return ApiProposalModel(
+        operation_name=matched_name,
+        operation_id=proposal.get("operation_id") or operation_schema.get("operationId") or matched_name,
+        method=method,
+        path=path,
+        payload=payload,
+        summary=str(proposal.get("summary", "")).strip() or str(operation_schema.get("summary", "")).strip(),
+        requires_approval=True,
+        logs=str(proposal.get("logs", "")).strip(),
+        allowed_url=effective_allowed_urls[0] if effective_allowed_urls else "",
+        allowed_urls=effective_allowed_urls,
+    ).model_dump()
+
+
+def _redact_for_log(value: Any, *, field_name: str = "") -> Any:
+    field = field_name.lower()
+    if field in {"subject", "body"} and isinstance(value, str):
+        return f"[redacted text len={len(value)}]"
+    if field in {"list_customer_ids", "customer_ids"} and isinstance(value, list):
+        return f"[redacted id list len={len(value)}]"
+    if field in {"customer_id", "customerid", "id"} and value is not None:
+        return "[redacted id]"
+    if field == "email" and value is not None:
+        return "[redacted email]"
+
+    if isinstance(value, dict):
+        return {key: _redact_for_log(item, field_name=str(key)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_for_log(item, field_name=field_name) for item in value]
+    return value
+
+
+def _parse_success_response(response: requests.Response) -> tuple[Any, bool]:
+    try:
+        return response.json(), True
+    except ValueError:
+        return {
+            "non_json_body": True,
+            "content_type": response.headers.get("Content-Type", ""),
+            "body_length": len(response.text or ""),
+            "message": "The API returned a successful non-JSON response body.",
+        }, False
 
 
 def execute_validated_api_call(
@@ -547,17 +598,20 @@ def execute_validated_api_call(
     headers = {"Content-Type": "application/json", "X-API-Key": api_key}
     timeout_seconds = SEND_REQUEST_TIMEOUT_SECONDS
 
-    print(f"[DEBUG][EXECUTE] resolved_base_url={base_url}")
-    print(f"[DEBUG][EXECUTE] resolved_path={path}")
-    print(f"[DEBUG][EXECUTE] validated_payload={json.dumps(payload, ensure_ascii=False)}")
-    print(f"[DEBUG][EXECUTE] timeout_seconds={timeout_seconds}")
-    print(f"[DEBUG][EXECUTE] request_url={url}")
-    print(f"[DEBUG][EXECUTE] request_method={method}")
-    print(f"[DEBUG][EXECUTE] request_payload={json.dumps(payload, ensure_ascii=False)}")
+    if get_executor_debug_enabled():
+        print(f"[DEBUG][EXECUTE] resolved_base_url={base_url}")
+        print(f"[DEBUG][EXECUTE] resolved_path={path}")
+        print(f"[DEBUG][EXECUTE] timeout_seconds={timeout_seconds}")
+        print(f"[DEBUG][EXECUTE] request_url={url}")
+        print(f"[DEBUG][EXECUTE] request_method={method}")
+        print(
+            f"[DEBUG][EXECUTE] request_payload={json.dumps(_redact_for_log(payload), ensure_ascii=False)}"
+        )
     _trace(f"Prepared {method} request for {path}")
 
     try:
-        print(f"[DEBUG][EXECUTE] sending_request method={method} url={url}")
+        if get_executor_debug_enabled():
+            print(f"[DEBUG][EXECUTE] sending_request method={method} url={url}")
         _trace("Sending live HTTP request to CampaignX")
         if method == "POST":
             response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
@@ -565,8 +619,8 @@ def execute_validated_api_call(
             response = requests.get(url, headers=headers, params=payload, timeout=timeout_seconds)
         else:
             raise ValueError(f"Unsupported execution method: {method}")
-        print(f"[DEBUG][EXECUTE] received_response status_code={response.status_code}")
-        print(f"[DEBUG][EXECUTE] response_text_preview={response.text[:500]}")
+        if get_executor_debug_enabled():
+            print(f"[DEBUG][EXECUTE] received_response status_code={response.status_code}")
         _trace(f"Received response with status {response.status_code}")
         response.raise_for_status()
     except requests.RequestException as exc:
@@ -574,16 +628,24 @@ def execute_validated_api_call(
             f"Campaign send request failed. url={url} timeout={timeout_seconds}s error={exc}"
         ) from exc
 
-    response_payload = response.json()
-    print(f"[DEBUG][EXECUTE] response_body={json.dumps(response_payload, ensure_ascii=False)}")
-    return {
-        "operation_id": validated_proposal.get("operation_id"),
-        "method": method,
-        "path": path,
-        "payload": payload,
-        "response": response_payload,
-        "campaign_id": response_payload.get("campaign_id") or response_payload.get("campaignId") or response_payload.get("id"),
-    }
+    response_payload, response_is_json = _parse_success_response(response)
+    if get_executor_debug_enabled():
+        print(
+            f"[DEBUG][EXECUTE] response_body={json.dumps(_redact_for_log(response_payload), ensure_ascii=False)}"
+        )
+    return CampaignExecutionResultModel(
+        operation_id=validated_proposal.get("operation_id"),
+        method=method,
+        path=path,
+        payload=payload,
+        response=response_payload,
+        response_is_json=response_is_json,
+        campaign_id=(
+            response_payload.get("campaign_id") or response_payload.get("campaignId") or response_payload.get("id")
+            if isinstance(response_payload, dict)
+            else None
+        ),
+    ).model_dump()
 
 
 def normalize_send_time(val: str | None) -> str:
@@ -592,8 +654,12 @@ def normalize_send_time(val: str | None) -> str:
     Preserves deliberate send-time choices when they are valid and future-dated.
     Falls back to now + 15 minutes only when parsing fails or the value is stale.
     """
+    return resolve_send_time_details(val)["send_time"]
+
+
+def resolve_send_time_details(val: str | None, *, now: datetime | None = None) -> dict[str, Any]:
     fmt = "%d:%m:%y %H:%M:%S"
-    now = datetime.now()
+    now = now or datetime.now()
 
     if isinstance(val, str) and val.strip():
         candidate = val.strip().replace("-", ":").replace("/", ":")
@@ -602,13 +668,30 @@ def normalize_send_time(val: str | None) -> str:
             if dt > now + timedelta(minutes=10):
                 send_time_str = dt.strftime(fmt)
                 print(f"[DEBUG] normalize_send_time: preserving planned send_time {send_time_str}")
-                return send_time_str
+                return SendTimeResolutionModel(
+                    send_time=send_time_str,
+                    used_fallback=False,
+                    reason="planned_send_time",
+                    message="Using the approved planned send time.",
+                ).model_dump()
         except Exception:
-            pass
+            fallback_reason = "invalid"
+            fallback_message = "Planned send time was invalid, so a near-future fallback was selected."
+        else:
+            fallback_reason = "stale"
+            fallback_message = "Planned send time was no longer in the future, so a near-future fallback was selected."
+    else:
+        fallback_reason = "missing"
+        fallback_message = "No planned send time was available, so a near-future fallback was selected."
 
     fallback = (now + timedelta(minutes=15)).strftime(fmt)
     print(f"[DEBUG] normalize_send_time: fallback to near-future default {fallback}")
-    return fallback
+    return SendTimeResolutionModel(
+        send_time=fallback,
+        used_fallback=True,
+        reason=fallback_reason,
+        message=fallback_message,
+    ).model_dump()
 
 
 def _spec_base_url(raw_spec: dict) -> str:
@@ -624,13 +707,14 @@ def fetch_customer_cohort_fresh() -> list[dict]:
     api_key = os.getenv("CAMPAIGNX_API_KEY")
     if not api_key:
         raise ValueError("CAMPAIGNX_API_KEY not set.")
+    allow_local_fallback = get_allow_local_cohort_fallback_enabled()
 
     raw_spec = _load_raw_spec()
     base_url = _spec_base_url(raw_spec)
     url = f"{base_url}/api/v1/get_customer_cohort"
     headers = {"Content-Type": "application/json", "X-API-Key": api_key}
 
-    # Try the live API first, then fall back to the local cohort file if it times out.
+    # Try the live API first. Local fallback is opt-in for explicit offline/demo flows only.
     resp = None
     last_error: Exception | None = None
     for attempt in range(COHORT_FETCH_MAX_ATTEMPTS):
@@ -657,6 +741,13 @@ def fetch_customer_cohort_fresh() -> list[dict]:
                 print(f"[ERROR] request error after all attempts: {e}")
 
     if resp is None:
+        if not allow_local_fallback:
+            raise RuntimeError(
+                "Failed to fetch the live customer cohort from CampaignX. "
+                "Local cohort fallback is disabled. "
+                "Enable CAMPAIGNX_ALLOW_LOCAL_COHORT_FALLBACK=true only for explicit demo/offline runs. "
+                f"Last network error: {last_error}"
+            )
         print(f"[WARN] Using local cohort fallback from {_LOCAL_COHORT_PATH}")
         try:
             return _load_local_customer_cohort()
@@ -669,6 +760,13 @@ def fetch_customer_cohort_fresh() -> list[dict]:
     try:
         payload = resp.json()
     except (ValueError, JSONDecodeError) as exc:
+        if not allow_local_fallback:
+            raise RuntimeError(
+                "Customer cohort API returned invalid JSON. "
+                "Local cohort fallback is disabled. "
+                "Enable CAMPAIGNX_ALLOW_LOCAL_COHORT_FALLBACK=true only for explicit demo/offline runs. "
+                f"JSON error: {exc}"
+            ) from exc
         print(f"[WARN] Cohort response was not valid JSON. Using local cohort fallback from {_LOCAL_COHORT_PATH}")
         try:
             return _load_local_customer_cohort()
@@ -691,6 +789,12 @@ def fetch_customer_cohort_fresh() -> list[dict]:
         cohort = None
 
     if not isinstance(cohort, list):
+        if not allow_local_fallback:
+            raise RuntimeError(
+                "Customer cohort API returned an unexpected response schema. "
+                "Local cohort fallback is disabled. "
+                "Enable CAMPAIGNX_ALLOW_LOCAL_COHORT_FALLBACK=true only for explicit demo/offline runs."
+            )
         print(f"[WARN] Unexpected cohort response shape. Using local cohort fallback from {_LOCAL_COHORT_PATH}")
         try:
             return _load_local_customer_cohort()
@@ -776,6 +880,8 @@ def _customer_is_active(customer: dict) -> bool:
 def _is_broad_audience_segment(segment: str) -> bool:
     if not segment:
         return False
+    if _is_active_segment(segment) or _is_inactive_segment(segment):
+        return False
     normalized = " ".join(re.findall(r"[a-z0-9]+", segment.lower()))
     broad_phrases = {
         "all",
@@ -791,15 +897,14 @@ def _is_broad_audience_segment(segment: str) -> bool:
         "mass audience",
         "broad audience",
         "all eligible customers",
-        "all active customers",
-        "all inactive customers",
     }
     if normalized in broad_phrases:
         return True
 
     broad_tokens = {"all", "everyone", "entire", "whole", "broad", "general", "mass"}
     tokens = set(re.findall(r"[a-z0-9]+", normalized))
-    return bool(tokens & broad_tokens) and bool(tokens & {"customer", "customers", "user", "users", "cohort", "audience", "eligible", "active", "inactive"})
+    audience_tokens = {"customer", "customers", "user", "users", "cohort", "audience", "eligible"}
+    return bool(tokens & broad_tokens) and bool(tokens & audience_tokens)
 
 
 def filter_customer_cohort(
@@ -835,22 +940,23 @@ def filter_customer_cohort(
                 continue
 
             kws = _segment_keywords(seg)
-            sample_blob = " ".join(_customer_search_blob(customer) for customer in cohort[: min(len(cohort), 25)])
-            if kws and any(k in sample_blob for k in kws):
-                supported_segments.append(seg)
+            segment_matches: list[dict] = []
+            if kws:
                 for customer in cohort:
                     blob = _customer_search_blob(customer)
                     if all(k in blob for k in kws):
-                        matched.append(customer)
+                        segment_matches.append(customer)
+            if segment_matches:
+                supported_segments.append(seg)
+                matching_notes.append(f'"{seg}" matched customers using cohort field values.')
+                matched.extend(segment_matches)
                 continue
 
             unsupported_segments.append(seg)
 
         if not matched and unsupported_segments:
-            matched = list(cohort)
-            schema_fallback_used = True
             matching_notes.append(
-                "Requested segments could not be matched from the available cohort fields, so the full cohort was used for testing."
+                "Requested segments could not be matched from the available cohort fields, so no customers were selected."
             )
 
     if matched:
@@ -974,7 +1080,8 @@ def execute_campaign_batched(
     if not isinstance(customer_ids, list) or not all(isinstance(x, str) for x in customer_ids):
         raise ValueError("customer_ids must be a list of strings")
 
-    send_time = normalize_send_time(send_time)
+    send_time_resolution = resolve_send_time_details(send_time)
+    send_time = send_time_resolution["send_time"]
 
     batches = _chunks([str(x) for x in customer_ids], batch_size)
     campaign_ids: list[str] = []
@@ -986,7 +1093,6 @@ def execute_campaign_batched(
             audience,
             send_time=send_time,
             customer_ids=batch,
-            use_agent=True,
             approved=approved,
         )
         if not approved:
@@ -1017,21 +1123,13 @@ def execute_campaign(
     send_time: str = None,
     *,
     customer_ids: list[str] | None = None,
-    use_agent: bool = True,  # default to agentic behavior
     approved: bool | None = None,
     approved_proposal: dict | None = None,
 ) -> dict:
     """
-    Executes the campaign in an "agentic" manner while retaining strict
-    validation of what eventually gets sent to the API.
-
     The send path is spec-driven and deterministic for hackathon stability:
     it reads the OpenAPI spec, validates the required payload shape, and only
     executes after approval using a direct HTTP request.
-
-    If `use_agent` is set to False the agent is skipped entirely and a simple
-    cohort fetch/filter is performed, as a fallback for testing or when the
-    agent is unavailable.
     """
     print(f"Executing campaign for {len(audience)} customers...")
 
@@ -1138,6 +1236,7 @@ def execute_campaign(
         },
         "payload": validated["payload"],
         "validated_proposal": validated,
+        "send_time_resolution": send_time_resolution,
         "logs": validated.get("logs", ""),
     }
 
@@ -1157,6 +1256,7 @@ def execute_campaign(
             "preview_ready": False,
             "campaign_id": executed.get("campaign_id"),
             "response": executed.get("response"),
+            "send_time_resolution": send_time_resolution,
             "logs": "\n".join(part for part in [validated.get("logs", ""), json.dumps(executed.get("response", {}), ensure_ascii=False)] if part).strip(),
         }
     )

@@ -4,13 +4,13 @@ import yaml
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pydantic import BaseModel, Field
-from agents.executor import (
+from agents.campaign_sender import execute_validated_api_call
+from agents.spec_planning import (
     HACKATHON_POLICY,
-    execute_validated_api_call,
     plan_api_call_from_spec,
     validate_api_call_proposal,
 )
-from utils.settings import get_spec_path
+from utils.settings import get_optimizer_auto_approve_sends_enabled, get_spec_path
 
 _SPEC_PATH = get_spec_path()
 OPTIMIZER_POLICY = {
@@ -531,11 +531,11 @@ def run_optimization_loop(
     on_attempt: callable = None,
 ) -> dict:
     """
-    Closed autonomous optimization loop for a single segment / batch.
+    Optimization retry loop for a single segment / batch.
 
-    This override keeps all 3 attempts, even if the target is met early.
+    Autonomous re-sends are disabled by default and require an explicit opt-in.
     """
-    from agents.executor import execute_campaign, normalize_send_time
+    from agents.campaign_sender import execute_campaign, normalize_send_time
 
     def _emit(msg: str):
         if on_status:
@@ -546,6 +546,13 @@ def run_optimization_loop(
     current_content = dict(content)
     attempts: list[dict] = []
     target_reached = False
+    auto_approve_sends = get_optimizer_auto_approve_sends_enabled()
+
+    if not auto_approve_sends:
+        raise PermissionError(
+            "Autonomous optimization sends are disabled. Manual approval is required for each retry. "
+            "Enable CAMPAIGNX_OPTIMIZER_AUTO_APPROVE_SENDS=true only for explicit demo/testing flows."
+        )
 
     for attempt in range(1, MAX_RETRIES + 1):
         _emit(f"Attempt {attempt}/{MAX_RETRIES} - sending campaign...")
@@ -656,12 +663,10 @@ def run_optimization_loop(
                 f"Click {click_rate}% >= {CLICK_RATE_TARGET}%"
             )
             target_reached = True
+            break
 
         if attempt == MAX_RETRIES:
-            if target_reached:
-                _emit(f"Completed all {MAX_RETRIES} optimization loops after reaching target during the run.")
-            else:
-                _emit(f"Completed all {MAX_RETRIES} optimization loops without hitting targets.")
+            _emit(f"Completed all {MAX_RETRIES} optimization loops without hitting targets.")
             time.sleep(1.5)
             break
 

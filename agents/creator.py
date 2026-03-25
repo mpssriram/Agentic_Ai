@@ -1,33 +1,15 @@
 import json
-import os
 import re
 from typing import Any
 
 from utils.scorer import rank_variants
-from utils.settings import get_fallback_copy
+from utils.ollama_client import ollama_generate_json
+from utils.settings import get_creator_debug_enabled, get_creator_policy, get_fallback_copy
 from utils.text import extract_urls
 from utils.validator import validate_body, validate_subject
 
-try:
-    from utils.ollama_client import ollama_generate_json
-except ImportError:
-    from ollama_client import ollama_generate_json
-
-
-GENERIC_DISALLOWED_PHRASES = [
-    "dear valued customer",
-    "we are excited to inform you",
-    "unique opportunity",
-    "check this out",
-    "limited time only",
-    "act now",
-    "once in a lifetime",
-    "guaranteed returns",
-    "risk free",
-    "risk-free",
-    "double your money",
-    "instant approval guaranteed",
-]
+CREATOR_POLICY = get_creator_policy()
+GENERIC_DISALLOWED_PHRASES = CREATOR_POLICY["disallowed_phrases"]
 
 FALLBACK_COPY = get_fallback_copy()
 GENERIC_FALLBACK_SUBJECTS = FALLBACK_COPY["subjects"]
@@ -38,7 +20,7 @@ GENERIC_FALLBACK_CTA_TEXT = FALLBACK_COPY["cta_text"]
 
 
 def _creator_debug(message: str) -> None:
-    if os.getenv("CREATOR_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
+    if get_creator_debug_enabled():
         print(f"[DEBUG][CREATOR] {message}")
 
 
@@ -52,7 +34,7 @@ def _is_mostly_english(text: str) -> bool:
     cleaned = re.sub(r"https?://\S+", "", text)
     cleaned = re.sub(r"[^A-Za-z0-9\s.,:;!?'\-()%/&]", "", cleaned)
     letters = re.findall(r"[A-Za-z]", cleaned)
-    return len(letters) >= 10
+    return len(letters) >= int(CREATOR_POLICY["minimum_english_letters"])
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -113,13 +95,13 @@ def _generation_config(plan: dict[str, Any]) -> dict[str, Any]:
     raw = plan.get("generation_config") or {}
     if not isinstance(raw, dict):
         raw = {}
-    subject_count = int(raw.get("subject_count", 5) or 5)
-    body_count = int(raw.get("body_count", 3) or 3)
-    tone = str(raw.get("tone", "trustworthy, clear, benefit-led") or "trustworthy, clear, benefit-led").strip()
-    body_word_target = str(raw.get("body_word_target", "60-110 words") or "60-110 words").strip()
+    subject_count = int(raw.get("subject_count", CREATOR_POLICY["default_subject_count"]) or CREATOR_POLICY["default_subject_count"])
+    body_count = int(raw.get("body_count", CREATOR_POLICY["default_body_count"]) or CREATOR_POLICY["default_body_count"])
+    tone = str(raw.get("tone", CREATOR_POLICY["default_tone"]) or CREATOR_POLICY["default_tone"]).strip()
+    body_word_target = str(raw.get("body_word_target", CREATOR_POLICY["default_body_word_target"]) or CREATOR_POLICY["default_body_word_target"]).strip()
     return {
-        "subject_count": max(3, min(subject_count, 10)),
-        "body_count": max(2, min(body_count, 10)),
+        "subject_count": max(int(CREATOR_POLICY["min_subject_count"]), min(subject_count, int(CREATOR_POLICY["max_subject_count"]))),
+        "body_count": max(int(CREATOR_POLICY["min_body_count"]), min(body_count, int(CREATOR_POLICY["max_body_count"]))),
         "tone": tone,
         "body_word_target": body_word_target,
     }
@@ -254,24 +236,13 @@ def _line_has_allowed_url(line: str, allowed_urls: list[str]) -> bool:
 
 def _looks_like_actionable_line(line: str) -> bool:
     lowered = (line or "").lower()
-    action_keywords = [
-        "review",
-        "compare",
-        "see",
-        "check",
-        "explore",
-        "visit",
-        "learn",
-        "apply",
-        "discover",
-        "find out",
-    ]
+    action_keywords = CREATOR_POLICY["action_keywords"]
     return any(keyword in lowered for keyword in action_keywords)
 
 
 def _is_valid_subject(subject: str) -> bool:
     subject = _normalize_whitespace(subject)
-    if not subject or len(subject) < 6 or len(subject) > 120:
+    if not subject or len(subject) < int(CREATOR_POLICY["subject_min_length"]) or len(subject) > int(CREATOR_POLICY["subject_max_length"]):
         return False
     if _contains_html(subject) or _contains_disallowed_phrase(subject):
         return False
@@ -341,9 +312,9 @@ def _sanitize_body(
         existing_urls = extract_urls("\n\n".join(kept_lines), unique=True)
         if not existing_urls:
             kept_lines.append(allowed_urls[0])
-        elif len(existing_urls) > 2:
+        elif len(existing_urls) > int(CREATOR_POLICY["max_body_urls"]):
             # keep body intact except limit repeated URL spam
-            first_two = existing_urls[:2]
+            first_two = existing_urls[: int(CREATOR_POLICY["max_body_urls"])]
             rebuilt: list[str] = []
             seen_urls: list[str] = []
             for line in kept_lines:
@@ -360,13 +331,13 @@ def _sanitize_body(
     final_body = _normalize_whitespace("\n\n".join(kept_lines))
 
     word_count = len(re.findall(r"\b\w+\b", final_body))
-    if word_count > 130:
+    if word_count > int(CREATOR_POLICY["body_soft_word_limit"]):
         # keep the first few strongest lines rather than rebuilding
         trimmed: list[str] = []
         running_words = 0
         for line in kept_lines:
             words = len(re.findall(r"\b\w+\b", line))
-            if trimmed and running_words + words > 120:
+            if trimmed and running_words + words > int(CREATOR_POLICY["body_trimmed_word_limit"]):
                 break
             trimmed.append(line)
             running_words += words
